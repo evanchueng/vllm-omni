@@ -1010,7 +1010,6 @@ class AsyncOmniEngine:
             "enable_distributed_layerwise_offload": kwargs.get(
                 "enable_distributed_layerwise_offload", False
             ),
-            "dp_size": kwargs.get("dp_size", 1),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),

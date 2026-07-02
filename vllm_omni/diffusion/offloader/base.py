@@ -26,7 +26,7 @@ class OffloadConfig:
     strategy: OffloadStrategy
     pin_cpu_memory: bool = True
     use_hsdp: bool = False
-    dp_size: int = 1
+    dp_size: int = 1  # derived from parallel_config, not user-configurable
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -35,6 +35,10 @@ class OffloadConfig:
         Enforces mutual exclusion among the three offload strategies.
         Distributed layer-wise takes the highest priority, then layer-wise,
         then model-level.
+
+        The ``dp_size`` is automatically derived from ``parallel_config`` —
+        it is NOT a user-configurable parameter. The distributed layerwise
+        offload works with whatever DP/SP parallelism is already set up.
 
         Args:
             od_config: OmniDiffusionConfig with offload settings
@@ -48,10 +52,20 @@ class OffloadConfig:
             od_config, "enable_distributed_layerwise_offload", False
         )
         pin_cpu_memory = getattr(od_config, "pin_cpu_memory", True)
-        dp_size = getattr(od_config, "dp_size", 1)
 
         parallel_config = getattr(od_config, "parallel_config", None)
         use_hsdp = getattr(parallel_config, "use_hsdp", False) if parallel_config else False
+
+        # Derive dp_size from parallel_config — not user-configurable.
+        # The offload adapts to whatever DP/SP is already configured.
+        dp_size = 1
+        if parallel_config is not None:
+            dp_size = getattr(parallel_config, "data_parallel_size", 1)
+            # HSDP's fully_shard_degree also contributes to effective DP
+            hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if use_hsdp else -1
+            hsdp_replicate_size = getattr(parallel_config, "hsdp_replicate_size", 1) if use_hsdp else 1
+            if use_hsdp and hsdp_shard_size > 0:
+                dp_size = hsdp_shard_size * hsdp_replicate_size
 
         # Determine strategy (mutual exclusion, distributed layer-wise takes priority)
         if enable_distributed_layerwise_offload:

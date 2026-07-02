@@ -456,7 +456,6 @@ class _DiffusionConfigProjection:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
-    dp_size: int = 1
     pin_cpu_memory: bool = True
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
