@@ -595,6 +595,20 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
+        omni_config_group.add_argument(
+            "--enable-distributed-layerwise-offload",
+            action="store_true",
+            help="Enable distributed layerwise offloading with H2D + AllGather overlap. "
+            "Shards weights across DP ranks, stores only 1/DP_size on each host, "
+            "and overlaps H2D transfers and AllGather with computation.",
+        )
+        omni_config_group.add_argument(
+            "--dp-size",
+            type=int,
+            default=1,
+            help="Number of devices for distributed layerwise weight sharding (default: 1). "
+            "Used with --enable-distributed-layerwise-offload.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

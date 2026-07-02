@@ -18,6 +18,7 @@ class OffloadStrategy(Enum):
     NONE = "none"
     MODEL_LEVEL = "model_level"  # Sequential offloading between DiT and encoders
     LAYER_WISE = "layer_wise"  # Block-level
+    DISTRIBUTED_LAYER_WISE = "distributed_layer_wise"  # Block-level with DP sharding + H2D/AllGather overlap
 
 
 @dataclass
@@ -25,13 +26,15 @@ class OffloadConfig:
     strategy: OffloadStrategy
     pin_cpu_memory: bool = True
     use_hsdp: bool = False
+    dp_size: int = 1
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
         """Extract and validate offload settings from OmniDiffusionConfig.
 
-        For now, enforces mutual exclusion between model-level and layer-wise offloading.
-        Layer-wise takes priority if both are enabled.
+        Enforces mutual exclusion among the three offload strategies.
+        Distributed layer-wise takes the highest priority, then layer-wise,
+        then model-level.
 
         Args:
             od_config: OmniDiffusionConfig with offload settings
@@ -41,13 +44,24 @@ class OffloadConfig:
         """
         enable_cpu_offload = getattr(od_config, "enable_cpu_offload", False)
         enable_layerwise_offload = getattr(od_config, "enable_layerwise_offload", False)
+        enable_distributed_layerwise_offload = getattr(
+            od_config, "enable_distributed_layerwise_offload", False
+        )
         pin_cpu_memory = getattr(od_config, "pin_cpu_memory", True)
+        dp_size = getattr(od_config, "dp_size", 1)
 
         parallel_config = getattr(od_config, "parallel_config", None)
         use_hsdp = getattr(parallel_config, "use_hsdp", False) if parallel_config else False
 
-        # Determine strategy (mutual exclusion, layer-wise takes priority)
-        if enable_layerwise_offload:
+        # Determine strategy (mutual exclusion, distributed layer-wise takes priority)
+        if enable_distributed_layerwise_offload:
+            strategy = OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            if enable_layerwise_offload or enable_cpu_offload:
+                logger.info(
+                    "Distributed layer-wise offloading takes priority, "
+                    "disabling other offloading strategies."
+                )
+        elif enable_layerwise_offload:
             strategy = OffloadStrategy.LAYER_WISE
             if enable_cpu_offload:
                 logger.info(
@@ -63,6 +77,7 @@ class OffloadConfig:
             strategy=strategy,
             pin_cpu_memory=pin_cpu_memory,
             use_hsdp=use_hsdp,
+            dp_size=dp_size,
         )
 
 
