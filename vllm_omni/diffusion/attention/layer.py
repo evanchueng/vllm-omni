@@ -112,6 +112,9 @@ class Attention(nn.Module):
         )
 
         self.softmax_scale = softmax_scale
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.head_size = head_size
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
         self.use_sync = use_sync
@@ -152,6 +155,11 @@ class Attention(nn.Module):
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
         self._init_kv_cache_quantization(config)
+
+        # RFC-3: Iterative (per-head-group) attention processing
+        self._iterative_attention: bool = False
+        self._iterative_group_size: int = 1
+        self._init_iterative_attention(config)
 
     def _get_active_parallel_strategy(self):
         """Get the parallel strategy based on current SP active state.
@@ -208,6 +216,27 @@ class Attention(nn.Module):
             if self.layer_idx is not None and self.layer_idx in skip_layers:
                 return False
         return True
+
+    def _init_iterative_attention(self, config) -> None:
+        """Read iterative attention settings from diffusion config (RFC-3)."""
+        if config is None:
+            return
+        self._iterative_attention = getattr(config, "enable_iterative_attention", False)
+        group_size = getattr(config, "iterative_attention_group_size", 1)
+        if self._iterative_attention:
+            if group_size < 1:
+                group_size = 1
+            # Clamp group_size to num_heads (no point iterating if group >= num_heads)
+            if group_size >= self.num_heads:
+                self._iterative_attention = False
+            else:
+                self._iterative_group_size = group_size
+                logger.info(
+                    "Iterative attention enabled on %s: group_size=%d, num_heads=%d",
+                    self.role,
+                    group_size,
+                    self.num_heads,
+                )
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         kv_cache_dtype = self._kv_cache_dtype
@@ -289,8 +318,53 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
+        # RFC-3: Per-head-group iterative attention to reduce activation memory
+        if self._iterative_attention:
+            return self._run_iterative_local_attention(query, key, value, attn_metadata)
+
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
+
+    def _run_iterative_local_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> torch.Tensor:
+        """Iterate through attention heads in groups to reduce peak activation memory.
+
+        Instead of passing all heads to the attention kernel at once, this method
+        loops over groups of heads, computes attention per group, and concatenates
+        the results. Only ``group_size`` heads' intermediates are held at a time.
+
+        Tensors are shaped [B, S, num_heads, head_dim]; head dim is axis 2.
+        For GQA, each query head group shares the corresponding KV head.
+        """
+        num_q_heads = query.shape[2]
+        num_kv_heads = key.shape[2]
+        group_size = self._iterative_group_size
+        # GQA ratio: how many Q heads per KV head
+        q_per_kv = num_q_heads // num_kv_heads
+
+        outputs: list[torch.Tensor] = []
+        for start in range(0, num_q_heads, group_size):
+            end = min(start + group_size, num_q_heads)
+            # Slice Q heads [start:end]
+            q_slice = query[:, :, start:end, :]
+
+            # Map Q head indices to KV head indices (GQA)
+            kv_start = start // q_per_kv
+            kv_end = (end + q_per_kv - 1) // q_per_kv
+            k_slice = key[:, :, kv_start:kv_end, :]
+            v_slice = value[:, :, kv_start:kv_end, :]
+
+            # Run attention kernel for this head group
+            out_slice = self.attention.forward(q_slice, k_slice, v_slice, attn_metadata)
+            outputs.append(out_slice)
+
+        # Concatenate along the head dimension (axis 2)
+        return torch.cat(outputs, dim=2)
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
         # Delegate to RingParallelAttention strategy if available

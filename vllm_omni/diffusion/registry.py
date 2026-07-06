@@ -13,6 +13,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.hooks.iterative_activation import apply_iterative_moe_hook
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 from vllm_omni.platforms import current_omni_platform
@@ -396,6 +397,7 @@ def initialize_model(
         # This follows diffusers' pattern where enable_parallelism() is called
         # at model loading time, not inside individual model files
         _apply_sequence_parallel_if_enabled(model, od_config)
+        _apply_iterative_activation_if_enabled(model, od_config)
 
         return model
     else:
@@ -476,6 +478,45 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
     except Exception as e:
         logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
+
+
+def _apply_iterative_activation_if_enabled(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
+    """Apply iterative activation processing hooks if enabled (RFC-3).
+
+    - Per-head iterative attention is handled directly in the ``Attention``
+      layer (reads config at init time), so no hook registration is needed.
+    - Per-chunk iterative MoE is applied here by discovering MoE blocks
+      (modules with both ``gate`` and ``experts`` attributes) and registering
+      ``IterativeMoEHook`` on each.
+
+    Args:
+        model: The pipeline model.
+        od_config: The OmniDiffusion configuration.
+    """
+    if not getattr(od_config, "enable_iterative_moe", False):
+        return
+
+    chunk_size = getattr(od_config, "moe_chunk_size", 4096)
+
+    # Discover MoE blocks via duck-typing: any module with both
+    # ``gate`` (nn.Module) and ``experts`` attributes.
+    moe_blocks: list[nn.Module] = []
+    for name, module in model.named_modules():
+        if hasattr(module, "gate") and hasattr(module, "experts") and isinstance(module.gate, nn.Module):
+            moe_blocks.append(module)
+
+    if not moe_blocks:
+        logger.warning("Iterative MoE enabled but no MoE blocks found in model.")
+        return
+
+    for block in moe_blocks:
+        apply_iterative_moe_hook(block, chunk_size=chunk_size)
+
+    logger.info(
+        "Iterative MoE applied to %d block(s) with chunk_size=%d",
+        len(moe_blocks),
+        chunk_size,
+    )
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

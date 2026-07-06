@@ -457,6 +457,11 @@ class _DiffusionConfigProjection:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     pin_cpu_memory: bool = True
+    # Iterative activation processing (RFC-3)
+    enable_iterative_attention: bool = False
+    iterative_attention_group_size: int = 1
+    enable_iterative_moe: bool = False
+    moe_chunk_size: int = 4096
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     mask_strategy_file_path: str | None = None

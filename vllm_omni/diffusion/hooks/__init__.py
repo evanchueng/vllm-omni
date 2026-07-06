@@ -8,6 +8,11 @@ from vllm_omni.diffusion.hooks.base import (
     ModelHook,
     StateManager,
 )
+from vllm_omni.diffusion.hooks.iterative_activation import (
+    IterativeMoEHook,
+    apply_iterative_moe_hook,
+    remove_iterative_moe_hook,
+)
 from vllm_omni.diffusion.hooks.sequence_parallel import (
     SequenceParallelGatherHook,
     SequenceParallelSplitHook,
@@ -30,4 +35,8 @@ __all__ = [
     "remove_sequence_parallel",
     "enable_sequence_parallel_for_model",
     "disable_sequence_parallel_for_model",
+    # Iterative activation processing (RFC-3)
+    "IterativeMoEHook",
+    "apply_iterative_moe_hook",
+    "remove_iterative_moe_hook",
 ]

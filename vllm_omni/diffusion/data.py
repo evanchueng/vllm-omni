@@ -642,6 +642,12 @@ class OmniDiffusionConfig:
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
+    # Iterative activation processing (RFC-3)
+    enable_iterative_attention: bool = False
+    iterative_attention_group_size: int = 1
+    enable_iterative_moe: bool = False
+    moe_chunk_size: int = 4096
+
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False

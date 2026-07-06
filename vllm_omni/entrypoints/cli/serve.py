@@ -603,6 +603,31 @@ class OmniServeCommand(CLISubcommand):
             "and overlaps H2D transfers and AllGather with computation. "
             "DP size is automatically derived from the parallel configuration.",
         )
+        # Iterative activation processing (RFC-3)
+        omni_config_group.add_argument(
+            "--enable-iterative-attention",
+            action="store_true",
+            help="Enable per-head-group iterative attention to reduce peak activation memory (RFC-3).",
+        )
+        omni_config_group.add_argument(
+            "--iterative-attention-group-size",
+            type=int,
+            default=1,
+            help="Number of attention heads per iteration group (default: 1 = per-head). "
+            "Larger groups improve GEMM utilization but increase memory.",
+        )
+        omni_config_group.add_argument(
+            "--enable-iterative-moe",
+            action="store_true",
+            help="Enable per-chunk iterative MoE processing to reduce peak activation memory (RFC-3).",
+        )
+        omni_config_group.add_argument(
+            "--moe-chunk-size",
+            type=int,
+            default=4096,
+            help="Number of tokens per MoE chunk (default: 4096). "
+            "Larger chunks improve GEMM utilization but increase memory.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

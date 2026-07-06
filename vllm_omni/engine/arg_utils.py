@@ -471,6 +471,11 @@ class OrchestratorArgs:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    # Iterative activation processing (RFC-3)
+    enable_iterative_attention: bool = False
+    iterative_attention_group_size: int = 1
+    enable_iterative_moe: bool = False
+    moe_chunk_size: int = 4096
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
