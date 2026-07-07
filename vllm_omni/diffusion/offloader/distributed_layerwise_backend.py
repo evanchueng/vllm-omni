@@ -159,6 +159,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         if self._owns_buffers:
             self._allocate_device_buffers()
 
+        # gpu_shard_buffers (AllGather input) are shared across all hooks,
+        # allocated by the backend in enable(). Initialized to None here;
+        # prefetch_layer falls back to torch.empty if not set (dp_size<=1).
+        self.gpu_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+
         return module
 
     @staticmethod
@@ -218,19 +223,17 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 )
                 current_offset += numel
 
-            # Split into shards and keep only this rank's shard
-            shard_size = total_numel // dp_size
-            remainder = total_numel % dp_size
-            # Distribute remainder across first `remainder` ranks
-            if remainder > 0 and rank < remainder:
-                shard_start = rank * (shard_size + 1)
-                shard_end = shard_start + shard_size + 1
-            else:
-                base_offset = remainder * (shard_size + 1)
-                shard_start = base_offset + (rank - remainder) * shard_size
-                shard_end = shard_start + shard_size
-
-            shard = full_cpu[shard_start:shard_end].clone()
+            # Split into equal-sized shards (pad to ceil(total/dp_size)) so
+            # all_gather_into_tensor receives identical input sizes on every
+            # rank.  The old remainder-distribution scheme produced unequal
+            # shards (e.g. [26,25,25,25]) which all_gather_into_tensor
+            # cannot handle — it requires all ranks to contribute the same
+            # number of elements.
+            shard_size = (total_numel + dp_size - 1) // dp_size  # ceil
+            shard_start = rank * shard_size
+            shard_end = min(shard_start + shard_size, total_numel)
+            shard = torch.zeros(shard_size, dtype=dtype)
+            shard[:shard_end - shard_start].copy_(full_cpu[shard_start:shard_end])
             if pin_memory:
                 shard = shard.pin_memory()
             # Free the full tensor; only the shard survives
@@ -246,7 +249,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             gpu_weights: dict[torch.dtype, torch.Tensor] = {}
             for dtype, metas in self.metadata.items():
                 total_numel = sum(m["numel"] for m in metas)
-                gpu_weights[dtype] = torch.empty(total_numel, dtype=dtype, device=self.device)
+                # AllGather output = dp_size * shard_size (padded)
+                padded = total_numel
+                if self.dp_size > 1:
+                    shard_sz = (total_numel + self.dp_size - 1) // self.dp_size
+                    padded = shard_sz * self.dp_size
+                gpu_weights[dtype] = torch.empty(padded, dtype=dtype, device=self.device)
             self.gpu_buffers[slot] = gpu_weights
 
     @property
@@ -289,9 +297,16 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             gpu_shards: dict[torch.dtype, torch.Tensor] = {}
             with current_omni_platform.stream(self.copy_stream):
                 for dtype, cpu_shard in self.cpu_shards.items():
-                    gpu_shard = torch.empty(
-                        cpu_shard.shape, dtype=dtype, device=self.device
-                    )
+                    # Use shared pre-allocated buffer (same address every layer)
+                    # so HCCL reuses internal comm buffers. Fall back to
+                    # torch.empty if shared buffers aren't allocated.
+                    shard_bufs = self.gpu_shard_buffers[slot]
+                    if shard_bufs is not None and dtype in shard_bufs:
+                        gpu_shard = shard_bufs[dtype][:cpu_shard.numel()].view(cpu_shard.shape)
+                    else:
+                        gpu_shard = torch.empty(
+                            cpu_shard.shape, dtype=dtype, device=self.device
+                        )
                     gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
                     gpu_shards[dtype] = gpu_shard
 
@@ -300,12 +315,19 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 for dtype, local_shard in gpu_shards.items():
                     full_buffer = self.gpu_buffers[slot][dtype]
                     total_numel = sum(m["numel"] for m in self.metadata[dtype])
-                    torch.distributed.all_gather_into_tensor(
-                        full_buffer[:total_numel],
+                    # AllGather output = dp * shard_size (padded for equal shards)
+                    shard_numel = local_shard.numel()
+                    ag_out = shard_numel * self.dp_size if self.dp_size > 1 else total_numel
+
+                    work = torch.distributed.all_gather_into_tensor(
+                        full_buffer[:ag_out],
                         local_shard,
                         group=self.dp_group,
                         async_op=True,
                     )
+                    # Store Work to prevent GC — without this the async op
+                    # may be silently waited on by the GC finaliser.
+                    self._pending_work = work
                 evt.record(self.comm_stream)
 
         self.ready_events[slot] = evt
@@ -482,9 +504,28 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 "Reduce dp_size or increase the number of devices."
             )
 
-        # Create DP group with the first dp_size ranks
+        # Create DP group with the first dp_size ranks.
+        # On NPU (HCCL), pass pg_options to limit the HCCL communication
+        # buffer size.  Without this, HCCL allocates rank-dependent internal
+        # buffers (up to ~15 GB on rank N-1 for a 4-rank group) that cause
+        # severe HBM imbalance across DP ranks even though PyTorch's own
+        # allocations are perfectly balanced.
         ranks = list(range(self.dp_size))
-        self.dp_group = torch.distributed.new_group(ranks=ranks, backend=backend)
+        pg_options = None
+        if backend == "hccl":
+            try:
+                from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+                pg_options = ProcessGroupHCCL.Options()
+                pg_options.group_name = f"dist_offload_dp_{self.dp_size}"
+                pg_options.hccl_config = {"hccl_buffer_size": 200}
+            except Exception as exc:
+                logger.warning(
+                    "Failed to set HCCL pg_options for dist offload DP group "
+                    "(%s); falling back to default buffer size.", exc,
+                )
+        self.dp_group = torch.distributed.new_group(
+            ranks=ranks, backend=backend, pg_options=pg_options,
+        )
 
         logger.info(
             "Distributed layerwise offload: dp_size=%d, rank=%d, backend=%s",
@@ -492,6 +533,123 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self.rank,
             backend,
         )
+
+    def _register_on_demand_hook(self, module: nn.Module, label: str) -> None:
+        """Register hooks that move *module* to GPU before forward and back to
+        CPU after forward.  This keeps VAE/encoders off GPU during DiT compute,
+        saving ~4.3 GB HBM per card.  They are loaded on-demand only for the
+        brief encode/decode phases.
+        """
+        device = self.device
+        pre_handles = []
+        post_handles = []
+
+        def _pre_forward(mod, args):
+            mod.to(device)
+
+        def _post_forward(mod, args, output):
+            mod.to("cpu")
+            current_omni_platform.synchronize()
+            current_omni_platform.empty_cache()
+
+        pre_handles.append(module.register_forward_pre_hook(_pre_forward))
+        post_handles.append(module.register_forward_hook(_post_forward))
+        if not hasattr(self, "_on_demand_hooks"):
+            self._on_demand_hooks = []
+        self._on_demand_hooks.extend(pre_handles + post_handles)
+        logger.info("On-demand offload hook registered for %s (%s)", label, module.__class__.__name__)
+
+    def _try_layerwise_offload_submodule(self, module: nn.Module, name: str) -> bool:
+        """Try to apply layerwise offload to a large submodule's blocks.
+
+        Searches for common block-list attributes (layers, blocks, h).
+        If found, applies the same layerwise streaming hooks used for the DiT,
+        so only 2 layers reside on GPU at a time instead of the full module.
+
+        Returns True if layerwise offload was applied, False otherwise.
+        """
+        from operator import attrgetter
+        blocks = None
+        blocks_attr = None
+        for attr_name in ("layers", "blocks", "h", "model.layers"):
+            try:
+                candidate = attrgetter(attr_name)(module)
+            except AttributeError:
+                continue
+            if isinstance(candidate, nn.ModuleList) and len(candidate) > 1:
+                blocks = candidate
+                blocks_attr = attr_name
+                break
+
+        if blocks is None:
+            return False
+
+        from .layerwise_backend import apply_block_hook
+
+        num_blocks = len(blocks)
+        logger.info(
+            "Distributed layerwise offload for submodule '%s.%s' (%d blocks, %.0f MB total, dp_size=%d)",
+            name, blocks_attr, num_blocks,
+            sum(p.nelement() * p.element_size() for p in module.parameters()) / 1048576,
+            self.dp_size,
+        )
+
+        # Move non-block parts of the submodule to GPU (small: embeddings, norms)
+        for child_name, child in module.named_children():
+            if child_name != blocks_attr:
+                child.to(self.device)
+
+        # Apply distributed hooks (1/4 sharding + AllGather, same as DiT)
+        # Pass shared_buffers=[None,None] to defer per-hook allocation
+        # (prevents OOM on large models where N hooks × 2 buffers >> HBM)
+        last_block, first_block = blocks[-1], blocks[0]
+        last_hook = apply_distributed_block_hook(
+            last_block, first_block, self.device,
+            self.dp_group, self.dp_size, self.rank,
+            self.copy_stream, self.comm_stream,
+            self.config.pin_cpu_memory,
+            shared_buffers=[None, None],
+        )
+        sub_hooks = [last_hook]
+        for i, block in enumerate(blocks[:-1]):
+            next_block = blocks[(i + 1) % num_blocks]
+            hook = apply_distributed_block_hook(
+                block, next_block, self.device,
+                self.dp_group, self.dp_size, self.rank,
+                self.copy_stream, self.comm_stream,
+                self.config.pin_cpu_memory,
+                shared_buffers=[None, None],
+            )
+            sub_hooks.append(hook)
+
+        # Allocate shared buffers for this submodule (2 output + 2 shard)
+        lm_shared_buffers = self._allocate_shared_buffers(sub_hooks)
+        lm_shared_shard_buffers = None
+        if self.dp_size > 1:
+            lm_shared_shard_buffers = self._allocate_shared_shard_buffers(sub_hooks)
+        for hook in sub_hooks:
+            hook.gpu_buffers = lm_shared_buffers
+            hook._owns_buffers = False
+            if lm_shared_shard_buffers is not None:
+                hook.gpu_shard_buffers = lm_shared_shard_buffers
+
+        # Wire backward references + slot alternation
+        for i in range(len(sub_hooks)):
+            sub_hooks[i]._prev_hook = sub_hooks[i - 1]
+        for i, hook in enumerate(sub_hooks):
+            hook.current_slot = i % 2
+
+        # Prefetch first block
+        first_slot = sub_hooks[0].current_slot
+        last_hook.prefetch_layer(slot=first_slot, non_blocking=False)
+        last_hook.get_weights(first_slot)
+
+        # Release per-hook buffer allocations (freed by empty_cache at end of enable)
+        current_omni_platform.synchronize()
+        current_omni_platform.empty_cache()
+
+        self._blocks.append(blocks)
+        return True
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
@@ -506,16 +664,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             logger.warning("No DiT/transformer modules found, skipping distributed layer-wise offloading")
             return
 
-        # Move encoders to GPU (they stay resident)
+        # Keep VAE/encoders on CPU; move to GPU on-demand via hooks.
+        # This saves ~4.3 GB HBM per card (VAE 1.3 + encoder 1.1 + sound 1.9)
+        # during the DiT forward pass.  They are only needed briefly for
+        # text-encoding (before DiT) and VAE-decode (after DiT).
         for enc in modules.encoders:
-            enc.to(self.device)
-
-        # Move VAE(s) to GPU if available
+            self._register_on_demand_hook(enc, "encoder")
         for vae in modules.vaes:
-            try:
-                vae.to(self.device, non_blocking=True)
-            except Exception as exc:
-                logger.debug("Failed to move VAE to GPU: %s", exc)
+            self._register_on_demand_hook(vae, "vae")
 
         # Move resident modules to GPU (small modules needed every forward)
         for name, module in zip(modules.resident_names, modules.resident_modules):
@@ -554,11 +710,21 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 dit_module.to(self.device)
                 continue
 
-            # Move non-block modules to GPU (they stay resident)
+            # Move non-block modules to GPU (they stay resident).
+            # Large modules (> 1 GB) use on-demand hooks instead — they are
+            # only needed briefly (e.g. language_model for text encoding)
+            # and keeping them resident wastes HBM during the DiT loop.
+            _ON_DEMAND_THRESHOLD = 1024  # MB
             for name, m in dit_module.named_children():
                 if name not in blocks_attr_names:
-                    m.to(self.device)
-                    logger.debug(f"Moved {name} to device {self.device}")
+                    _mb = sum(p.nelement() * p.element_size() for p in m.parameters()) / 1048576
+                    if _mb > _ON_DEMAND_THRESHOLD:
+                        if self._try_layerwise_offload_submodule(m, name):
+                            pass  # layerwise hooks applied
+                        else:
+                            self._register_on_demand_hook(m, name)
+                    else:
+                        m.to(self.device)
                 else:
                     logger.debug(f"Skipped blocks module {name}")
 
@@ -575,7 +741,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # All hooks share 2 global device buffers (RFC: "exactly two layers on device")
             last_block, first_block = blocks[-1], blocks[0]
 
-            # Pass 1: create hooks with shared_buffers=None (defer allocation)
+            # Pass 1: create hooks with deferred buffer allocation
+            # (shared_buffers=[None,None] prevents per-hook OOM on large models)
             last_hook = apply_distributed_block_hook(
                 last_block,
                 first_block,
@@ -586,6 +753,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self.copy_stream,
                 self.comm_stream,
                 self.config.pin_cpu_memory,
+                shared_buffers=[None, None],
             )
 
             block_hooks: list[DistributedLayerwiseOffloadHook] = [last_hook]
@@ -601,14 +769,23 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.copy_stream,
                     self.comm_stream,
                     self.config.pin_cpu_memory,
+                    shared_buffers=[None, None],
                 )
                 block_hooks.append(hook)
 
             # Pass 2: allocate 2 shared buffers sized to the largest block
             shared_buffers = self._allocate_shared_buffers(block_hooks)
+            # Also allocate 2 shared shard (AllGather input) buffers so all
+            # hooks reuse the same device address — lets HCCL reuse its
+            # internal comm buffers and avoids 6+ GB of per-hook allocations.
+            shared_shard_buffers = None
+            if self.dp_size > 1:
+                shared_shard_buffers = self._allocate_shared_shard_buffers(block_hooks)
             for hook in block_hooks:
                 hook.gpu_buffers = shared_buffers
                 hook._owns_buffers = False
+                if shared_shard_buffers is not None:
+                    hook.gpu_shard_buffers = shared_shard_buffers
 
             # Wire backward references for cache-dit fallback
             for i in range(len(block_hooks)):
@@ -634,6 +811,27 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         if len(self._blocks) > 0 and len(self._blocks[0]) > 0:
             self.enabled = True
+            # Block weights have been moved to CPU (replaced with zero-element
+            # placeholders on device). Synchronize async H2D copies, then
+            # release the freed device memory back to the allocator so that
+            # npu-smi / nvidia-smi reflect the true resident footprint.
+            # Without this the caching allocator retains the full model's
+            # worth of freed HBM, causing misleadingly high idle usage.
+            current_omni_platform.synchronize()
+            current_omni_platform.empty_cache()
+            # Return freed CPU memory to the OS.  Model loading allocates the
+            # full model on CPU; after sharding each rank keeps only 1/dp_size.
+            # glibc malloc retains the freed 3/4 in its free list instead of
+            # munmap-ing it, inflating cgroup total_rss by ~100 GB.  gc + malloc_trim
+            # forces the return so that dist_offload's 1/N sharding actually
+            # shows up as lower CPU RSS.
+            import gc as _gc
+            import ctypes as _ctypes
+            _gc.collect()
+            try:
+                _ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
     def disable(self) -> None:
         if not self.enabled:
@@ -660,8 +858,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """
         max_sizes: dict[torch.dtype, int] = {}
         for hook in hooks:
+            dp = hook.dp_size
             for dtype, metas in hook.metadata.items():
                 total = sum(m["numel"] for m in metas)
+                # AllGather output = dp * ceil(total/dp) (padded for equal shards)
+                if dp > 1:
+                    total = ((total + dp - 1) // dp) * dp
                 if dtype not in max_sizes or total > max_sizes[dtype]:
                     max_sizes[dtype] = total
 
@@ -678,6 +880,39 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_sizes.items()},
         )
         return shared_buffers
+
+    @staticmethod
+    def _allocate_shared_shard_buffers(
+        hooks: list[DistributedLayerwiseOffloadHook],
+    ) -> list[dict[torch.dtype, torch.Tensor] | None]:
+        """Allocate 2 shared shard (AllGather input) buffers sized to the
+        largest per-rank shard.
+
+        All hooks share these 2 input buffers — the same device address is
+        reused for every layer's AllGather so HCCL can reuse its internal
+        communication buffers (preventing rank-dependent HBM imbalance).
+        Cost: 2 × max_shard_size (~184 MB) instead of 2 × N_hooks × shard.
+        """
+        max_shard_sizes: dict[torch.dtype, int] = {}
+        for hook in hooks:
+            for dtype, shard in hook.cpu_shards.items():
+                numel = shard.numel()
+                if dtype not in max_shard_sizes or numel > max_shard_sizes[dtype]:
+                    max_shard_sizes[dtype] = numel
+
+        device = hooks[0].device
+        shared_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        for slot in range(2):
+            shard_bufs: dict[torch.dtype, torch.Tensor] = {}
+            for dtype, numel in max_shard_sizes.items():
+                shard_bufs[dtype] = torch.empty(numel, dtype=dtype, device=device)
+            shared_shard_buffers[slot] = shard_bufs
+
+        logger.info(
+            "Allocated 2 shared shard buffers (max shard size: %s)",
+            {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_shard_sizes.items()},
+        )
+        return shared_shard_buffers
 
     # ------------------------------------------------------------------ #
     #  Block discovery (reuses LayerWiseOffloadBackend logic)            #
