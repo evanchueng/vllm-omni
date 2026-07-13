@@ -660,20 +660,22 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 continue
 
             # Non-block modules: small ones go to GPU; large ones (> 1 GB)
-            # stay on CPU with on-demand hooks (moved to GPU only during their
-            # forward pass, then back to CPU).  This includes language_model
-            # (~60 GB) and any other large submodule.
+            # are layerwise-offloaded (only 2 layers on GPU at a time) if they
+            # have a block-list, otherwise kept on CPU with on-demand hooks.
             _ON_DEMAND_THRESHOLD = 1024  # MB
             for name, m in dit_module.named_children():
                 if name not in blocks_attr_names:
                     _mb = sum(p.nelement() * p.element_size() for p in m.parameters()) / 1048576
                     if _mb > _ON_DEMAND_THRESHOLD:
-                        logger.info(
-                            "Submodule '%s' (%.0f MB) > %d MB threshold; "
-                            "keeping on CPU with on-demand hook",
-                            name, _mb, _ON_DEMAND_THRESHOLD,
-                        )
-                        self._register_on_demand_hook(m, name)
+                        if self._try_layerwise_offload_submodule(m, name):
+                            logger.info(
+                                "Submodule '%s' (%.0f MB) layerwise-offloaded",
+                                name, _mb)
+                        else:
+                            logger.info(
+                                "Submodule '%s' (%.0f MB) on-demand CPU offload",
+                                name, _mb)
+                            self._register_on_demand_hook(m, name)
                     else:
                         m.to(self.device)
                         logger.debug(f"Moved {name} to device {self.device}")
