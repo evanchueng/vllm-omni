@@ -34,6 +34,11 @@ from .module_collector import ModuleDiscovery
 logger = init_logger(__name__)
 
 
+def _dtype_size(dtype: torch.dtype) -> int:
+    """Return element size in bytes for a torch.dtype."""
+    return torch.empty(1, dtype=dtype).element_size()
+
+
 class DistributedLayerwiseOffloadHook(ModelHook):
     """Hook for distributed layerwise offloading with fixed double-buffer.
 
@@ -57,6 +62,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         copy_stream: Any | None = None,
         comm_stream: Any | None = None,
         pin_memory: bool = True,
+        shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -70,8 +76,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
 
-        # Fixed double buffers: exactly two slots
-        self.gpu_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        # Double buffers: either shared (from backend) or self-allocated (lazy)
+        if shared_buffers is not None:
+            self.gpu_buffers: list[dict[torch.dtype, torch.Tensor] | None] = shared_buffers
+            self._owns_buffers = False
+        else:
+            self.gpu_buffers = [None, None]
+            self._owns_buffers = True
         self.ready_events: list[Any | None] = [None, None]
 
         # Sharded host weights for the next block, keyed by dtype
@@ -144,8 +155,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self.pin_memory,
         )
 
-        # Pre-allocate two device buffers (double-buffer)
-        self._allocate_device_buffers()
+        # Allocate device buffers only when this hook owns its buffers
+        # (standalone usage).  When the backend passes shared_buffers
+        # (even [None, None]), _owns_buffers is False and allocation is
+        # deferred to the backend's unified _allocate_shared_buffers.
+        if self._owns_buffers:
+            self._allocate_device_buffers()
 
         return module
 
@@ -182,15 +197,23 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
             total_numel = sum(local.numel() for _, _, local in weights_with_local)
 
-            # Build full flattened CPU tensor (temporary), then extract shard
-            full_cpu = torch.empty(total_numel, dtype=dtype, device="cpu")
+            # Equal-sized shards (ceil division) for all_gather_into_tensor
+            # compatibility.  Ranks whose shard extends past total_numel are
+            # zero-padded.
+            shard_size = (total_numel + dp_size - 1) // dp_size  # ceil
+            shard_start = rank * shard_size
+            shard_end = min(shard_start + shard_size, total_numel)
+
+            # Allocate ONLY the shard (1/dp_size of the block, padded to ceil)
+            shard = torch.zeros(shard_size, dtype=dtype, device="cpu")
 
             current_offset = 0
             for name, original_tensor, local_tensor in weights_with_local:
                 numel = local_tensor.numel()
-                full_cpu[current_offset : current_offset + numel].copy_(local_tensor.flatten())
                 if dtype not in dtype_metadata:
                     dtype_metadata[dtype] = []
+                # Offsets remain relative to the FULL flattened buffer
+                # (needed for correct AllGather reconstruction).
                 dtype_metadata[dtype].append(
                     {
                         "name": name,
@@ -199,30 +222,29 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         "shape": local_tensor.shape,
                     }
                 )
-                # Replace original tensor with placeholder
+
+                # Copy ONLY the portion of this param that falls within
+                # this rank's shard range [shard_start, shard_end).
+                overlap_start = max(current_offset, shard_start)
+                overlap_end = min(current_offset + numel, shard_end)
+                if overlap_start < overlap_end:
+                    src_start = overlap_start - current_offset
+                    src_end = overlap_end - current_offset
+                    dst_start = overlap_start - shard_start
+                    dst_end = overlap_end - shard_start
+                    shard[dst_start:dst_end].copy_(
+                        local_tensor.flatten()[src_start:src_end]
+                    )
+
+                # Replace original tensor with placeholder (frees CPU storage)
                 DistributedLayerwiseOffloadHook._set_tensor_storage(
                     original_tensor,
                     DistributedLayerwiseOffloadHook._make_offload_placeholder(original_tensor),
                 )
                 current_offset += numel
 
-            # Split into shards and keep only this rank's shard
-            shard_size = total_numel // dp_size
-            remainder = total_numel % dp_size
-            # Distribute remainder across first `remainder` ranks
-            if remainder > 0 and rank < remainder:
-                shard_start = rank * (shard_size + 1)
-                shard_end = shard_start + shard_size + 1
-            else:
-                base_offset = remainder * (shard_size + 1)
-                shard_start = base_offset + (rank - remainder) * shard_size
-                shard_end = shard_start + shard_size
-
-            shard = full_cpu[shard_start:shard_end].clone()
             if pin_memory:
                 shard = shard.pin_memory()
-            # Free the full tensor; only the shard survives
-            del full_cpu
 
             cpu_shards[dtype] = shard
 
@@ -259,55 +281,47 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # --- Stage 1: H2D (local shard: host -> device) on copy_stream ---
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
 
-        gpu_shards: dict[torch.dtype, torch.Tensor] = {}
-        evt_h2d = current_omni_platform.Event()
-
-        with current_omni_platform.stream(self.copy_stream):
-            for dtype, cpu_shard in self.cpu_shards.items():
-                gpu_shard = torch.empty(cpu_shard.shape, dtype=dtype, device=self.device)
-                gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
-                gpu_shards[dtype] = gpu_shard
-            evt_h2d.record(self.copy_stream)
-
-        # --- Stage 2: AllGather on comm_stream (waits for H2D) ---
-        self.comm_stream.wait_stream(self.copy_stream)
-
         evt = current_omni_platform.Event()
 
-        with current_omni_platform.stream(self.comm_stream):
-            for dtype, local_shard in gpu_shards.items():
-                full_buffer = self.gpu_buffers[slot][dtype]
+        if self.dp_size <= 1 or self.dp_group is None:
+            # Fast path for single-rank: H2D directly into shared buffer
+            with current_omni_platform.stream(self.copy_stream):
+                for dtype, cpu_shard in self.cpu_shards.items():
+                    full_buffer = self.gpu_buffers[slot][dtype]
+                    full_buffer.copy_(cpu_shard, non_blocking=non_blocking)
+                evt.record(self.copy_stream)
+        else:
+            # Multi-rank: H2D to device shard, then AllGather into shared buffer
+            # Key optimization: use all_gather_into_tensor (single collective,
+            # no intermediate list, no manual concatenation loop)
+            # async_op=True so the Python thread doesn't block, allowing H2D
+            # of the next layer to overlap with this AllGather + compute.
+            gpu_shards: dict[torch.dtype, torch.Tensor] = {}
+            with current_omni_platform.stream(self.copy_stream):
+                for dtype, cpu_shard in self.cpu_shards.items():
+                    gpu_shard = torch.empty(
+                        cpu_shard.shape, dtype=dtype, device=self.device
+                    )
+                    gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
+                    gpu_shards[dtype] = gpu_shard
 
-                if self.dp_size > 1 and self.dp_group is not None:
-                    # AllGather: reconstruct full weights from all ranks
-                    gathered = [torch.empty_like(local_shard) for _ in range(self.dp_size)]
-                    work = torch.distributed.all_gather(
-                        gathered,
+            self.comm_stream.wait_stream(self.copy_stream)
+            with current_omni_platform.stream(self.comm_stream):
+                for dtype, local_shard in gpu_shards.items():
+                    full_buffer = self.gpu_buffers[slot][dtype]
+                    total_numel = sum(m["numel"] for m in self.metadata[dtype])
+                    torch.distributed.all_gather_into_tensor(
+                        full_buffer[:total_numel],
                         local_shard,
                         group=self.dp_group,
                         async_op=True,
                     )
-                    if work is not None:
-                        work.wait()
-
-                    # Concatenate gathered shards into the full buffer
-                    offset = 0
-                    for shard in gathered:
-                        n = shard.numel()
-                        full_buffer[offset : offset + n].copy_(shard)
-                        offset += n
-                else:
-                    # Single-rank: just copy the shard (which is the full weight)
-                    full_buffer.copy_(local_shard)
-
-            evt.record(self.comm_stream)
+                evt.record(self.comm_stream)
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
 
         # Re-point next block's parameters to the device buffer slices
-        # (must happen after the AllGather event is recorded, so the
-        # compute stream will wait via get_weights before using them)
         for dtype, ordered_metadata in self.metadata.items():
             gpu_weight = self.gpu_buffers[slot][dtype]
             for metadata in ordered_metadata:
@@ -393,6 +407,7 @@ def apply_distributed_block_hook(
     copy_stream: Any | None = None,
     comm_stream: Any | None = None,
     pin_memory: bool = True,
+    shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -405,6 +420,7 @@ def apply_distributed_block_hook(
         copy_stream=copy_stream,
         comm_stream=comm_stream,
         pin_memory=pin_memory,
+        shared_buffers=shared_buffers,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -520,6 +536,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         logger.info("Applying distributed layer-wise offloading on %s", modules.dit_names)
 
+        # Collect ALL hooks across ALL module groups so that a single pair of
+        # shared buffers can be allocated at the end (unified sharing).
+        all_block_hooks: list[DistributedLayerwiseOffloadHook] = []
+
         # Apply hooks for each DiT module
         for i, dit_module in enumerate(modules.dits):
             dit_name = modules.dit_names[i]
@@ -567,6 +587,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # Register hooks in a circular sliding window:
             # last block prefetches first block, block i prefetches block (i+1)
             last_block, first_block = blocks[-1], blocks[0]
+
+            # Create hooks with deferred buffer allocation — pass
+            # shared_buffers=[None, None] so _owns_buffers=False and
+            # initialize_hook skips _allocate_device_buffers().  The
+            # backend assigns unified shared buffers after all hooks
+            # across all module groups are collected.
             last_hook = apply_distributed_block_hook(
                 last_block,
                 first_block,
@@ -577,10 +603,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self.copy_stream,
                 self.comm_stream,
                 self.config.pin_cpu_memory,
+                shared_buffers=[None, None],
             )
-            # Manually prefetch first block (synchronous) so it's ready for the first forward
-            last_hook.prefetch_layer(slot=0, non_blocking=False)
-            last_hook.get_weights(slot=0)
 
             block_hooks: list[DistributedLayerwiseOffloadHook] = [last_hook]
             for i, block in enumerate(blocks[:-1]):
@@ -595,6 +619,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.copy_stream,
                     self.comm_stream,
                     self.config.pin_cpu_memory,
+                    shared_buffers=[None, None],
                 )
                 block_hooks.append(hook)
 
@@ -602,15 +627,45 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for i in range(len(block_hooks)):
                 block_hooks[i]._prev_hook = block_hooks[i - 1]
 
-            logger.info(
-                f"Distributed layer-wise offloading enabled on {num_blocks} layers (blocks), "
-                f"dp_size={self.dp_size}"
-            )
+            # Initialize alternating slots: even-indexed hooks use slot 0 first,
+            # odd-indexed use slot 1. This ensures consecutive blocks never
+            # collide on the same shared buffer slot during prefetch.
+            for i, hook in enumerate(block_hooks):
+                hook.current_slot = i % 2
 
+            all_block_hooks.extend(block_hooks)
             self._blocks.append(blocks)
 
-        if len(self._blocks) > 0 and len(self._blocks[0]) > 0:
-            self.enabled = True
+        if not all_block_hooks:
+            return
+
+        # Allocate 2 unified shared buffers sized to the largest block across
+        # ALL module groups (not per-group).  This halves peak HBM when there
+        # are multiple DiT modules (e.g. 4 buffers → 2).
+        shared_buffers = self._allocate_shared_buffers(all_block_hooks)
+        for hook in all_block_hooks:
+            hook.gpu_buffers = shared_buffers
+            hook._owns_buffers = False
+
+        # Prefetch first block of EACH module group (synchronous) so it is
+        # ready before the group's first forward pass.
+        hook_offset = 0
+        for blocks in self._blocks:
+            num_blocks = len(blocks)
+            group_hooks = all_block_hooks[hook_offset : hook_offset + num_blocks]
+            first_slot = group_hooks[0].current_slot
+            group_hooks[-1].prefetch_layer(slot=first_slot, non_blocking=False)
+            group_hooks[-1].get_weights(first_slot)
+            hook_offset += num_blocks
+
+        total_blocks = sum(len(b) for b in self._blocks)
+        logger.info(
+            f"Distributed layer-wise offloading enabled on {total_blocks} blocks across "
+            f"{len(self._blocks)} module group(s), dp_size={self.dp_size}, "
+            f"shared_buffers=2 (unified across all groups)"
+        )
+
+        self.enabled = True
 
     def disable(self) -> None:
         if not self.enabled:
@@ -623,6 +678,41 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._blocks.clear()
         self.enabled = False
         logger.info("Distributed layer-wise offloading disabled")
+
+    @staticmethod
+    def _allocate_shared_buffers(
+        hooks: list[DistributedLayerwiseOffloadHook],
+    ) -> list[dict[torch.dtype, torch.Tensor] | None]:
+        """Allocate exactly 2 shared device buffers sized to the largest block.
+
+        All hooks share these 2 buffers. At any time, slot 0 holds the current
+        layer's weights and slot 1 holds the next layer's weights (or vice
+        versa). This ensures only 2 layers' worth of weights reside on device,
+        regardless of the total number of blocks.
+        """
+        max_sizes: dict[torch.dtype, int] = {}
+        for hook in hooks:
+            for dtype, metas in hook.metadata.items():
+                total = sum(m["numel"] for m in metas)
+                # AllGather output = dp * ceil(total/dp) (padded for equal shards)
+                if hook.dp_size > 1:
+                    total = ((total + hook.dp_size - 1) // hook.dp_size) * hook.dp_size
+                if dtype not in max_sizes or total > max_sizes[dtype]:
+                    max_sizes[dtype] = total
+
+        device = hooks[0].device
+        shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        for slot in range(2):
+            gpu_weights: dict[torch.dtype, torch.Tensor] = {}
+            for dtype, total_numel in max_sizes.items():
+                gpu_weights[dtype] = torch.empty(total_numel, dtype=dtype, device=device)
+            shared_buffers[slot] = gpu_weights
+
+        logger.info(
+            "Allocated 2 shared device buffers (max block size: %s)",
+            {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_sizes.items()},
+        )
+        return shared_buffers
 
     # ------------------------------------------------------------------ #
     #  Block discovery (reuses LayerWiseOffloadBackend logic)            #

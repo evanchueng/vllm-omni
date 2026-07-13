@@ -257,14 +257,14 @@ class TestDistributedLayerwiseOffloadHook:
         assert torch.equal(shard, torch.tensor([102.0, 103.0]))
 
     def test_sharding_with_remainder(self, dist_group, patched_offload_runtime):
-        """Verify sharding handles non-even division with remainder."""
+        """Verify sharding handles non-even division with padding."""
         block = nn.Module()
         block.weight = nn.Parameter(torch.arange(3, dtype=torch.float32))
 
         next_block = nn.Module()
         next_block.weight = nn.Parameter(torch.arange(100, 103, dtype=torch.float32))
 
-        # 3 elements, dp_size=2: rank 0 gets 2, rank 1 gets 1
+        # 3 elements, dp_size=2: both ranks get ceil(3/2)=2 elements (padded)
         hook0 = DistributedLayerwiseOffloadHook(
             next_block=next_block,
             device=torch.device("cpu"),
@@ -298,8 +298,9 @@ class TestDistributedLayerwiseOffloadHook:
         hook1.initialize_hook(block1)
 
         shard1 = hook1.cpu_shards[torch.float32]
-        assert shard1.numel() == 1
-        assert torch.equal(shard1, torch.tensor([102.0]))
+        # Equal-sized shards: rank 1 gets [102, 0] (zero-padded)
+        assert shard1.numel() == 2
+        assert torch.equal(shard1, torch.tensor([102.0, 0.0]))
 
 
 class _DummyBlock(nn.Module):
