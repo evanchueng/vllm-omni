@@ -609,16 +609,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             logger.warning("No DiT/transformer modules found, skipping distributed layer-wise offloading")
             return
 
-        # Move encoders to GPU (they stay resident)
+        # Keep VAE/encoders on CPU; move to GPU on-demand via hooks.
+        # This saves several GB HBM per card during the DiT forward pass.
+        # They are only needed briefly for text-encoding (before DiT) and
+        # VAE-decode (after DiT).
         for enc in modules.encoders:
-            enc.to(self.device)
-
-        # Move VAE(s) to GPU if available
+            self._register_on_demand_hook(enc, "encoder")
         for vae in modules.vaes:
-            try:
-                vae.to(self.device, non_blocking=True)
-            except Exception as exc:
-                logger.debug("Failed to move VAE to GPU: %s", exc)
+            self._register_on_demand_hook(vae, "vae")
 
         # Move resident modules to GPU (small modules needed every forward)
         for name, module in zip(modules.resident_names, modules.resident_modules):
