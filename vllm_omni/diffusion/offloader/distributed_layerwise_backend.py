@@ -460,6 +460,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.dp_size = config.dp_size
         self.rank = 0
         self._blocks: list[list[nn.Module]] = []
+        self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
 
     def _init_dp_group(self) -> None:
         """Create the DP process group with auto-detected backend."""
@@ -502,6 +503,98 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self.rank,
             backend,
         )
+
+    def _register_on_demand_hook(self, module: nn.Module, label: str) -> None:
+        """Register hooks that move *module* to GPU before forward and back to
+        CPU after forward.  Keeps large non-block modules (VAE, encoders) off
+        GPU during the DiT compute loop.
+        """
+        device = self.device
+        pre_handles = []
+        post_handles = []
+
+        def _pre_forward(mod, args):
+            mod.to(device)
+
+        def _post_forward(mod, args, output):
+            mod.to("cpu")
+            current_omni_platform.synchronize()
+            current_omni_platform.empty_cache()
+
+        pre_handles.append(module.register_forward_pre_hook(_pre_forward))
+        post_handles.append(module.register_forward_hook(_post_forward))
+        if not hasattr(self, "_on_demand_handles"):
+            self._on_demand_handles = []
+        self._on_demand_handles.extend(pre_handles + post_handles)
+
+    def _try_layerwise_offload_submodule(self, module: nn.Module, name: str) -> bool:
+        """Try to apply layerwise offload to a large submodule's blocks.
+
+        Searches for common block-list attributes (layers, blocks, h).
+        If found, applies the same distributed layerwise streaming hooks
+        used for the DiT, so only 2 layers reside on GPU at a time.
+        Returns True if layerwise offload was applied, False otherwise.
+        """
+        from operator import attrgetter
+        blocks = None
+        blocks_attr = None
+        for attr_name in ("layers", "blocks", "h", "model.layers"):
+            try:
+                candidate = attrgetter(attr_name)(module)
+            except AttributeError:
+                continue
+            if isinstance(candidate, nn.ModuleList) and len(candidate) > 1:
+                blocks = candidate
+                blocks_attr = attr_name
+                break
+
+        if blocks is None:
+            return False
+
+        num_blocks = len(blocks)
+        logger.info(
+            "Distributed layerwise offload for submodule '%s.%s' (%d blocks, %.0f MB total, dp_size=%d)",
+            name, blocks_attr, num_blocks,
+            sum(p.nelement() * p.element_size() for p in module.parameters()) / 1048576,
+            self.dp_size,
+        )
+
+        # Move non-block parts of the submodule to GPU (small: embeddings, norms)
+        for child_name, child in module.named_children():
+            if child_name != blocks_attr:
+                child.to(self.device)
+
+        # Apply distributed hooks with deferred buffer allocation
+        last_block, first_block = blocks[-1], blocks[0]
+        last_hook = apply_distributed_block_hook(
+            last_block, first_block, self.device,
+            self.dp_group, self.dp_size, self.rank,
+            self.copy_stream, self.comm_stream,
+            self.config.pin_cpu_memory,
+            shared_buffers=[None, None],
+        )
+        sub_hooks = [last_hook]
+        for i, block in enumerate(blocks[:-1]):
+            next_block = blocks[(i + 1) % num_blocks]
+            hook = apply_distributed_block_hook(
+                block, next_block, self.device,
+                self.dp_group, self.dp_size, self.rank,
+                self.copy_stream, self.comm_stream,
+                self.config.pin_cpu_memory,
+                shared_buffers=[None, None],
+            )
+            sub_hooks.append(hook)
+
+        # Wire backward references + slot alternation
+        for i in range(len(sub_hooks)):
+            sub_hooks[i]._prev_hook = sub_hooks[i - 1]
+        for i, hook in enumerate(sub_hooks):
+            hook.current_slot = i % 2
+
+        # Defer buffer allocation and prefetch to enable() unified allocation
+        self._all_hook_groups.append(sub_hooks)
+        self._blocks.append(blocks)
+        return True
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
@@ -568,11 +661,24 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 dit_module.to(self.device)
                 continue
 
-            # Move non-block modules to GPU (they stay resident)
+            # Move non-block modules to GPU (they stay resident).
+            # Large modules (> 1 GB) are layerwise-offloaded instead of being
+            # moved to GPU wholesale, preventing OOM on big models (e.g.
+            # Cosmos3-Super's 60 GB language_model).
+            _ON_DEMAND_THRESHOLD = 1024  # MB
             for name, m in dit_module.named_children():
                 if name not in blocks_attr_names:
-                    m.to(self.device)
-                    logger.debug(f"Moved {name} to device {self.device}")
+                    _mb = sum(p.nelement() * p.element_size() for p in m.parameters()) / 1048576
+                    if _mb > _ON_DEMAND_THRESHOLD:
+                        if self._try_layerwise_offload_submodule(m, name):
+                            pass  # layerwise hooks applied
+                        else:
+                            logger.warning(
+                                "Submodule '%s' is %.0f MB but has no block-list; "
+                                "leaving on CPU.", name, _mb)
+                    else:
+                        m.to(self.device)
+                        logger.debug(f"Moved {name} to device {self.device}")
                 else:
                     logger.debug(f"Skipped blocks module {name}")
 
@@ -675,7 +781,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for block in blocks:
                 remove_distributed_block_hook(block)
 
+        for h in getattr(self, "_on_demand_handles", []):
+            h.remove()
+        self._on_demand_handles = []
+
         self._blocks.clear()
+        self._all_hook_groups.clear()
         self.enabled = False
         logger.info("Distributed layer-wise offloading disabled")
 
