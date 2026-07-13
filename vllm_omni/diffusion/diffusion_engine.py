@@ -165,7 +165,20 @@ class DiffusionEngine:
             self.execute_fn = self.executor.execute_request
 
         try:
-            self._dummy_run()
+            # Skip dummy run for distributed layerwise offload with DP > 1.
+            # The dummy run sends a request to only 1 worker, but AllGather
+            # requires ALL workers to participate simultaneously.  A dummy
+            # run on 1 worker causes AllGather call misalignment across
+            # DP ranks → garbled output.
+            skip_dummy = (
+                getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+                and getattr(self.od_config, "parallel_config", None) is not None
+                and getattr(self.od_config.parallel_config, "data_parallel_size", 1) > 1
+            )
+            if skip_dummy:
+                logger.info("Skipping dummy run (dist_offload with DP > 1)")
+            else:
+                self._dummy_run()
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
             self.close()

@@ -637,6 +637,8 @@ class OmniDiffusionConfig:
     enable_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
+    # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
+    enable_distributed_layerwise_offload: bool = False
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
