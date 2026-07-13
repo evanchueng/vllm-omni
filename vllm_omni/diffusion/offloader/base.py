@@ -67,6 +67,16 @@ class OffloadConfig:
             if use_hsdp and hsdp_shard_size > 0:
                 dp_size = hsdp_shard_size * hsdp_replicate_size
 
+            # When there is no DP but SP > 1, shard weights across SP ranks.
+            # AllGather reconstructs full weights per layer; each rank then
+            # computes on its SP portion of the sequence.  This gives N×
+            # compute parallelism with 1/N H2D transfer, reusing the exact
+            # same AllGather code path — only the process group changes.
+            if dp_size <= 1:
+                sp_size = getattr(parallel_config, "sequence_parallel_size", 1)
+                if sp_size and sp_size > 1:
+                    dp_size = sp_size
+
         # Determine strategy (mutual exclusion, distributed layer-wise takes priority)
         if enable_distributed_layerwise_offload:
             strategy = OffloadStrategy.DISTRIBUTED_LAYER_WISE
