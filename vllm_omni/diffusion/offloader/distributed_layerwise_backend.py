@@ -659,21 +659,21 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 dit_module.to(self.device)
                 continue
 
-            # Move non-block modules to GPU (they stay resident).
-            # Large modules (> 1 GB) are layerwise-offloaded instead of being
-            # moved to GPU wholesale, preventing OOM on big models (e.g.
-            # Cosmos3-Super's 60 GB language_model).
+            # Non-block modules: small ones go to GPU; large ones (> 1 GB)
+            # stay on CPU with on-demand hooks (moved to GPU only during their
+            # forward pass, then back to CPU).  This includes language_model
+            # (~60 GB) and any other large submodule.
             _ON_DEMAND_THRESHOLD = 1024  # MB
             for name, m in dit_module.named_children():
                 if name not in blocks_attr_names:
                     _mb = sum(p.nelement() * p.element_size() for p in m.parameters()) / 1048576
                     if _mb > _ON_DEMAND_THRESHOLD:
-                        if self._try_layerwise_offload_submodule(m, name):
-                            pass  # layerwise hooks applied
-                        else:
-                            logger.warning(
-                                "Submodule '%s' is %.0f MB but has no block-list; "
-                                "leaving on CPU.", name, _mb)
+                        logger.info(
+                            "Submodule '%s' (%.0f MB) > %d MB threshold; "
+                            "keeping on CPU with on-demand hook",
+                            name, _mb, _ON_DEMAND_THRESHOLD,
+                        )
+                        self._register_on_demand_hook(m, name)
                     else:
                         m.to(self.device)
                         logger.debug(f"Moved {name} to device {self.device}")
