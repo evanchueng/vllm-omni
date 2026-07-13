@@ -137,7 +137,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return
 
         load_device = (
-            "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
+            "cpu"
+            if self.od_config.enable_cpu_offload
+            or self.od_config.enable_layerwise_offload
+            or getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            else str(self.device)
         )
 
         def get_memory_context():
@@ -305,7 +309,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
         use_hsdp = self.od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        use_distributed_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+        grad_context = (
+            torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
+        )
         with grad_context:
             # Receive AR KV (fetch → distribute → apply inside the entry). prefetch on:
             # consume prior-forward payload, sync-fallback on miss; else sync receive.
