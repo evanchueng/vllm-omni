@@ -82,13 +82,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         broadcast_handle = self._broadcast_mq.export_handle()
 
         # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
-        self._result_mq = self._init_result_queue(result_handle)
+        processes, result_handles = self._launch_workers(broadcast_handle, self.wake_events)
+        self._result_mqs = self._init_result_queues(result_handles)
+        # Keep backward compat: _result_mq points to rank 0's queue
+        self._result_mq = self._result_mqs[0] if self._result_mqs else None
         self._processes = processes
 
         self.resources = BackgroundResources(
             broadcast_mq=self._broadcast_mq,
-            result_mq=self._result_mq,
+            result_mq=self._result_mqs[0] if self._result_mqs else None,
             num_workers=num_workers,
             processes=self._processes,
         )
@@ -103,20 +105,38 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             local_reader_ranks=list(range(num_workers)),
         )
 
-    def _init_result_queue(self, result_handle) -> MessageQueue | None:
-        if result_handle is None:
-            logger.error("Failed to get result queue handle from workers")
-            return None
-        return MessageQueue.create_from_handle(result_handle, 0)
+    def _init_result_queues(self, result_handles: list) -> list[MessageQueue]:
+        """Create one reader per worker result queue."""
+        queues: list[MessageQueue] = []
+        for i, handle in enumerate(result_handles):
+            if handle is None:
+                logger.error(f"Failed to get result queue handle from worker {i}")
+                queues.append(None)  # type: ignore
+            else:
+                queues.append(MessageQueue.create_from_handle(handle, 0))
+        return queues
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("DiffusionExecutor is closed.")
-        if self._result_mq is None:
-            raise RuntimeError("Result queue not initialized")
+        if not hasattr(self, "_result_mqs") or not self._result_mqs:
+            raise RuntimeError("Result queues not initialized")
 
     def _dequeue_one_with_failure_polling(self, deadline: float | None, method: str) -> Any:
-        """Block until one result message, polling ``is_failed`` between chunk timeouts."""
+        """Block until one result message, polling ``is_failed`` between chunk timeouts.
+
+        When multiple result queues exist (one per worker), polls all of them
+        round-robin to collect responses from any worker.
+        """
+        # Determine which queues to poll
+        if hasattr(self, "_result_mqs") and self._result_mqs:
+            mqs = [mq for mq in self._result_mqs if mq is not None]
+        else:
+            mqs = [self._result_mq] if self._result_mq else []
+
+        if not mqs:
+            raise RuntimeError("No result queue available")
+
         while True:
             if deadline is None:
                 chunk_timeout = _DEQUEUE_TIMEOUT_S
@@ -125,12 +145,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if remaining <= 0:
                     raise TimeoutError(f"RPC call to {method} timed out.")
                 chunk_timeout = min(_DEQUEUE_TIMEOUT_S, remaining)
-            try:
-                return self._result_mq.dequeue(timeout=chunk_timeout)
-            except (TimeoutError, zmq.error.Again):
-                if self.is_failed:
-                    raise EngineDeadError()
-                continue
+
+            # Poll each queue with a short timeout
+            per_q_timeout = max(0.05, chunk_timeout / max(len(mqs), 1))
+            for mq in mqs:
+                try:
+                    return mq.dequeue(timeout=per_q_timeout)
+                except (TimeoutError, zmq.error.Again):
+                    continue
+
+            if self.is_failed:
+                raise EngineDeadError()
+            continue
 
     @staticmethod
     def _raise_for_rpc_error_dict(response: Any) -> None:
@@ -222,7 +248,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         # Wait for all workers to be ready
         scheduler_infos = []
-        result_handle = None
+        result_handles: list = []
         for writer in scheduler_pipe_writers:
             writer.close()
 
@@ -238,15 +264,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if data["status"] != "ready":
                 raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-            if i == 0:
-                result_handle = data.get("result_handle")
+            result_handles.append(data.get("result_handle"))
 
             scheduler_infos.append(data)
             reader.close()
 
         logger.debug("All workers are ready")
 
-        return processes, result_handle
+        return processes, result_handles
 
     def start_worker_monitor(self) -> None:
         # Monitors worker process liveness. If any die unexpectedly,
@@ -337,12 +362,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 )
                 # results is a list of N DiffusionOutputs (one per rank)
                 results = results if isinstance(results, list) else [results]
-                if len(results) < len(new_reqs):
-                    raise RuntimeError(
-                        f"Expected {len(new_reqs)} responses, got {len(results)}"
-                    )
                 for i, new_req in enumerate(new_reqs):
-                    res = results[i]
+                    res = results[i] if i < len(results) else results[0]
                     if not isinstance(res, DiffusionOutput):
                         raise RuntimeError(f"Unexpected response type [{i}]: {type(res)!r}")
                     runner_outputs.append(RunnerOutput(
@@ -474,10 +495,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             #   (N responses, one per worker)
             # - Otherwise: 1 response (only rank 0 or specified rank)
             if unique_reply_rank is None and exec_all_ranks:
-                # Use data_parallel_size (number of DP workers that reply),
-                # not num_gpus (which includes TP/SP ranks).
-                dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
-                num_responses = max(1, dp_size)
+                num_responses = self.od_config.num_gpus
             else:
                 num_responses = 1
 
@@ -514,6 +532,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._finalizer()
         finally:
             self._broadcast_mq = None
+            self._result_mqs = []
             self._result_mq = None
             self.resources = None
             self._processes = []

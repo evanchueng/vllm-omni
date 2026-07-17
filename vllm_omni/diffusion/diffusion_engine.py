@@ -224,6 +224,9 @@ class DiffusionEngine:
             )
 
         try:
+            # Skip dummy run for distributed layerwise offload with DP > 1.
+            # The dummy run sends a request to only 1 worker, but AllGather
+            # requires ALL workers to participate simultaneously.  A dummy
             # Skip dummy run when AllGather is used with DP > 1 (AllGather
             # requires all ranks active simultaneously).  When use_allgather=False,
             # each rank loads full weights independently — dummy run is safe.

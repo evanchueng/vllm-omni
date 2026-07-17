@@ -622,12 +622,18 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--use-allgather",
-            action=argparse.BooleanOptionalAction,
+            action="store_true",
             default=True,
             help="Use shard + AllGather for weight reconstruction (default: True). "
-            "Pass --no-use-allgather to disable: each rank loads full weights "
+            "When disabled (--no-use-allgather), each rank loads full weights "
             "via H2D only — no sharding, no AllGather, no concurrent request "
             "requirement, but N× CPU memory.",
+        )
+        omni_config_group.add_argument(
+            "--no-use-allgather",
+            dest="use_allgather",
+            action="store_false",
+            help="Disable AllGather: each rank loads full weights independently.",
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(

@@ -791,17 +791,12 @@ class WorkerProc:
         self.result_mq = None
         self.result_mq_handle = None
 
-        # Setup result sender (only for rank 0)
-        if gpu_id == 0:
-            self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
-            self.result_mq_handle = self.result_mq.export_handle()
-            WorkerProc._shared_result_handle = self.result_mq_handle
-            logger.info(f"Worker {gpu_id} created result MessageQueue")
-        else:
-            handle = getattr(WorkerProc, "_shared_result_handle", None)
-            if handle:
-                self.result_mq = MessageQueue.create_from_handle(handle, gpu_id)
-                logger.info(f"Worker {gpu_id} attached to shared result MessageQueue")
+        # Each worker creates its own result MessageQueue (as writer).
+        # The executor creates one reader per worker to collect responses.
+        # This supports DP multi-concurrency where all ranks reply independently.
+        self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
+        self.result_mq_handle = self.result_mq.export_handle()
+        logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
 
@@ -1036,7 +1031,7 @@ class WorkerProc:
             pipe_writer.send(
                 {
                     "status": "ready",
-                    "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
+                    "result_handle": worker_proc.result_mq_handle,
                 }
             )
             worker_proc.worker_busy_loop()
