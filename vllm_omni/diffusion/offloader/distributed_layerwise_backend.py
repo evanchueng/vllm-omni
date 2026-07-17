@@ -388,10 +388,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             self._prev_hook.get_weights(self.current_slot)
 
-        # Ensure current block's weights are ready (wait on ready event)
-        self.get_weights(self.current_slot)
-
-        # Prefetch next layer into the other slot (overlapped with compute)
+        # Prefetch next layer into the other slot (overlapped with compute).
+        # No explicit get_weights() here — offload_layer() in the previous
+        # hook's post_forward already enqueued wait_event for the current
+        # layer's H2D/AllGather, which is sufficient to ensure compute_stream
+        # waits for weights before reading them.  The redundant wait_event
+        # caused cascading NPU stream synchronization stalls (~10ms/layer).
         next_slot = 1 - self.current_slot
         self.prefetch_layer(next_slot, non_blocking=True)
 
