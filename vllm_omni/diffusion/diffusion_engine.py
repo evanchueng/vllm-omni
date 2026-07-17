@@ -172,6 +172,26 @@ class DiffusionEngine:
         )
         self.scheduler.initialize(od_config)
         self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
+        # DP multi-concurrency: allow batching dp_size requests for dist_offload_dp.
+        # Only needed when use_allgather=True (AllGather requires all ranks active).
+        # When use_allgather=False, each rank is independent — no batching needed.
+        use_allgather = getattr(od_config, "use_allgather", True)
+        is_dist_offload_dp = (
+            getattr(od_config, "enable_distributed_layerwise_offload", False)
+            and use_allgather
+            and getattr(od_config, "parallel_config", None) is not None
+            and getattr(od_config.parallel_config, "data_parallel_size", 1) > 1
+        )
+        if is_dist_offload_dp:
+            dp_size = od_config.parallel_config.data_parallel_size
+            self.scheduler.max_num_running_reqs = dp_size
+            self.dp_concurrent = True
+            # Ensure batch admission waits for requests to accumulate
+            if getattr(od_config, "request_batch_max_wait_ms", 0) == 0:
+                od_config.request_batch_max_wait_ms = 500.0
+            logger.info(f"dist_offload_dp: max_num_running_reqs={dp_size}, batch_wait={od_config.request_batch_max_wait_ms}ms")
+        else:
+            self.dp_concurrent = False
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -204,7 +224,20 @@ class DiffusionEngine:
             )
 
         try:
-            self._dummy_run()
+            # Skip dummy run when AllGather is used with DP > 1 (AllGather
+            # requires all ranks active simultaneously).  When use_allgather=False,
+            # each rank loads full weights independently — dummy run is safe.
+            use_allgather = getattr(self.od_config, "use_allgather", True)
+            skip_dummy = (
+                getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+                and use_allgather
+                and getattr(self.od_config, "parallel_config", None) is not None
+                and getattr(self.od_config.parallel_config, "data_parallel_size", 1) > 1
+            )
+            if skip_dummy:
+                logger.info("Skipping dummy run (dist_offload with DP > 1 and AllGather)")
+            else:
+                self._dummy_run()
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
             self.close()
@@ -359,7 +392,7 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
-                if self.supports_request_batch:
+                if self.supports_request_batch or self.dp_concurrent:
                     self._wait_for_request_batch_admission_locked()
 
                 sched_output = self.scheduler.schedule()
@@ -409,7 +442,7 @@ class DiffusionEngine:
 
         Caller must hold ``self._cv``.
         """
-        if self.step_execution or not self.supports_request_batch:
+        if self.step_execution or (not self.supports_request_batch and not self.dp_concurrent):
             return
 
         max_wait_s = self.od_config.request_batch_max_wait_ms / 1000.0
@@ -427,9 +460,12 @@ class DiffusionEngine:
         deadline = start + max_wait_s
         last_waiting = -1
         stable_since = start
-        # Require a short idle period with no queue growth so bursty HTTP
-        # ingress can land before the first schedule() of a wave.
-        stable_window_s = min(0.05, max_wait_s / 5.0)
+        # For dp_concurrent, use a longer stable window so all dp_size
+        # HTTP requests have time to land before scheduling.
+        if self.dp_concurrent:
+            stable_window_s = min(0.3, max_wait_s / 2.0)
+        else:
+            stable_window_s = min(0.05, max_wait_s / 5.0)
 
         while not self.stop_event.is_set():
             waiting = self.scheduler.num_waiting_requests()

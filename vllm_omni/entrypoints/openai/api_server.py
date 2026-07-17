@@ -60,12 +60,18 @@ from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
-from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
+try:
+    from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
+except ImportError:
+    ServingTokens = None
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
 from vllm.entrypoints.serve.instrumentator.basic import base
-from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
+try:
+    from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
+except ImportError:
+    from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization as ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
     process_lora_modules,
@@ -84,7 +90,10 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
-from vllm.renderers.online_renderer import OnlineRenderer
+try:
+    from vllm.renderers.online_renderer import OnlineRenderer
+except ImportError:
+    OnlineRenderer = None
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
@@ -902,20 +911,23 @@ async def omni_init_app_state(
 
     # NOTE: kept aligned with upstream `init_app_state`:
     # Use OnlineRenderer (replaced OpenAIServingRender which was removed upstream).
-    state.online_renderer = OnlineRenderer(
-        model_config=engine_client.model_config,
-        renderer=engine_client.renderer,
-        request_logger=request_logger,
-        chat_template=resolved_chat_template,
-        chat_template_content_format=args.chat_template_content_format,
-        trust_request_chat_template=args.trust_request_chat_template,
-        enable_auto_tools=args.enable_auto_tool_choice,
-        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
-        log_error_stack=args.log_error_stack,
-    )
+    if OnlineRenderer is not None:
+        state.online_renderer = OnlineRenderer(
+            model_config=engine_client.model_config,
+            renderer=engine_client.renderer,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            trust_request_chat_template=args.trust_request_chat_template,
+            enable_auto_tools=args.enable_auto_tool_choice,
+            exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+            tool_parser=args.tool_call_parser,
+            reasoning_parser=args.structured_outputs_config.reasoning_parser,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            log_error_stack=args.log_error_stack,
+        )
+    else:
+        state.online_renderer = None
 
     state.openai_serving_responses = (
         OpenAIServingResponses(
@@ -934,7 +946,7 @@ async def omni_init_app_state(
             enable_force_include_usage=args.enable_force_include_usage,
             enable_log_outputs=args.enable_log_outputs,
         )
-        if "generate" in supported_tasks
+        if ServingTokens is not None and "generate" in supported_tasks
         else None
     )
     state.openai_serving_chat = (
@@ -958,7 +970,7 @@ async def omni_init_app_state(
             enable_log_outputs=args.enable_log_outputs,
             enable_log_deltas=args.enable_log_deltas,
         )
-        if "generate" in supported_tasks
+        if ServingTokens is not None and "generate" in supported_tasks
         else None
     )
     # Warm up chat template processing to avoid first-request latency
@@ -975,7 +987,7 @@ async def omni_init_app_state(
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
         )
-        if "generate" in supported_tasks
+        if ServingTokens is not None and "generate" in supported_tasks
         else None
     )
     state.openai_serving_pooling = (
@@ -1067,7 +1079,7 @@ async def omni_init_app_state(
             enable_force_include_usage=args.enable_force_include_usage,
             default_chat_template_kwargs=args.default_chat_template_kwargs,
         )
-        if "generate" in supported_tasks
+        if ServingTokens is not None and "generate" in supported_tasks
         else None
     )
     state.serving_tokens = (
@@ -1081,7 +1093,7 @@ async def omni_init_app_state(
             enable_log_outputs=args.enable_log_outputs,
             force_no_detokenize=args.tokens_only,
         )
-        if "generate" in supported_tasks
+        if ServingTokens is not None and "generate" in supported_tasks
         else None
     )
 

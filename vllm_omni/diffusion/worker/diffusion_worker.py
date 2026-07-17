@@ -408,12 +408,30 @@ class DiffusionWorker:
 
     def execute_model(
         self,
-        req: OmniDiffusionRequest,
+        req: OmniDiffusionRequest | list[OmniDiffusionRequest],
         od_config: OmniDiffusionConfig,
         kv_prefetch_jobs: dict | None = None,
     ) -> DiffusionOutput:
-        """Execute a forward pass by delegating to the model runner."""
+        """Execute a forward pass by delegating to the model runner.
+
+        If *req* is a list (DP multi-concurrency), each rank picks one
+        request based on its distributed rank.  AllGather in the layerwise
+        offload only gathers weight shards (request-independent), so all
+        ranks stay synchronised at each AllGather call while computing
+        different activations.
+
+        Each rank returns its OWN DiffusionOutput (no gather).  The executor
+        collects N responses via result_mq (all ranks share one queue).
+        """
         assert self.model_runner is not None, "Model runner not initialized"
+
+        # DP multi-concurrency: pick one request per rank
+        is_batch = isinstance(req, list)
+        if is_batch:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            idx = rank % len(req)
+            req = req[idx]
+
         if self.lora_manager is not None:
             try:
                 self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
@@ -427,6 +445,11 @@ class DiffusionWorker:
             output = self.model_runner.execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
         if profiler:
             profiler.step()
+
+        # Each rank returns its own output independently.
+        # No gather needed — all ranks share the same result_mq and
+        # each enqueues its own DiffusionOutput.  The executor
+        # dequeues N responses (one per rank).
         return output
 
     def execute_model_batch(
