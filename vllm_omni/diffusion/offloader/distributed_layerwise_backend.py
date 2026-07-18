@@ -109,6 +109,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         # Pending async AllGather work (prevent GC before completion).
         self._pending_work: Any | None = None
+        self._cached_repoint: list | None = None
 
     # ------------------------------------------------------------------ #
     #  DTensor helpers (shared with LayerwiseOffloadHook)                 #
@@ -164,6 +165,27 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # Allocate device buffers only if not using shared buffers from backend
         if self._owns_buffers:
             self._allocate_device_buffers()
+
+        # Cache parameter re-pointing metadata to avoid per-layer dict lookups.
+        self._cached_repoint = []
+        for slot in range(2):
+            repoint = []
+            for dtype, metas in self.metadata.items():
+                for m in metas:
+                    target = (
+                        self.next_block_parameters[m["name"]]
+                        if m["name"] in self.next_block_parameters
+                        else self.next_block_buffers[m["name"]]
+                    )
+                    repoint.append((target, dtype, m["offset"], m["numel"], m["shape"]))
+            self._cached_repoint.append(repoint)
+
+        # Pre-compute AG output sizes (avoid sum() per layer).
+        self._ag_output_sizes: dict[torch.dtype, int] = {}
+        for dtype, metas in self.metadata.items():
+            total_numel = sum(m["numel"] for m in metas)
+            shard_numel = self.cpu_shards[dtype].numel()
+            self._ag_output_sizes[dtype] = shard_numel * self.dp_size if self.dp_size > 1 else total_numel
 
         return module
 
@@ -280,10 +302,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     def prefetch_layer(self, slot: int, non_blocking: bool = True) -> None:
         """Prepare next block's weights into a freshly-allocated device tensor.
 
-        Unlike the shared-buffer approach, each call allocates a new GPU
-        tensor (matching the non-distributed LayerwiseOffloadHook).  The
-        tensor is kept alive by the parameter's .data reference until
-        offload_layer replaces it with a placeholder.
+        CPU-optimised: uses cached metadata and pre-computed AG sizes.
         """
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
 
@@ -310,10 +329,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self.comm_stream.wait_stream(self.copy_stream)
             with current_omni_platform.stream(self.comm_stream):
                 for dtype, local_shard in gpu_shards.items():
-                    total_numel = sum(m["numel"] for m in self.metadata[dtype])
-                    shard_numel = local_shard.numel()
-                    ag_out = shard_numel * self.dp_size if self.dp_size > 1 else total_numel
-                    gw = torch.empty(ag_out, dtype=dtype, device=self.device)
+                    gw = torch.empty(self._ag_output_sizes[dtype], dtype=dtype, device=self.device)
                     torch.distributed.all_gather_into_tensor(
                         gw, local_shard, group=self.dp_group,
                     )
@@ -323,22 +339,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.ready_events[slot] = evt
         self._prefetch_done = evt
 
-        # Re-point next block's parameters to the device buffer slices
-        for dtype, ordered_metadata in self.metadata.items():
-            gpu_weight = gpu_weights[dtype]
-            for metadata in ordered_metadata:
-                target_name = metadata["name"]
-                target = (
-                    self.next_block_parameters[target_name]
-                    if target_name in self.next_block_parameters
-                    else self.next_block_buffers[target_name]
-                )
-                DistributedLayerwiseOffloadHook._set_tensor_storage(
-                    target,
-                    gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
-                        metadata["shape"]
-                    ),
-                )
+        # Re-point using cached metadata (avoids per-layer dict lookups).
+        for target, dtype, offset, numel, shape in self._cached_repoint[slot]:
+            DistributedLayerwiseOffloadHook._set_tensor_storage(
+                target,
+                gpu_weights[dtype][offset : offset + numel].view(shape),
+            )
 
     def get_weights(self, slot: int) -> dict[torch.dtype, torch.Tensor] | None:
         """Wait for AllGather completion and return full weights for the slot.
