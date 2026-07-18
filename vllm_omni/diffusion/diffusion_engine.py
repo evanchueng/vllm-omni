@@ -172,24 +172,21 @@ class DiffusionEngine:
         )
         self.scheduler.initialize(od_config)
         self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
-        # DP multi-concurrency: allow batching dp_size requests for dist_offload_dp.
-        # Only needed when use_allgather=True (AllGather requires all ranks active).
-        # When use_allgather=False, each rank is independent — no batching needed.
-        use_allgather = getattr(od_config, "use_allgather", True)
-        is_dist_offload_dp = (
-            getattr(od_config, "enable_distributed_layerwise_offload", False)
-            and use_allgather
-            and getattr(od_config, "parallel_config", None) is not None
-            and getattr(od_config.parallel_config, "data_parallel_size", 1) > 1
-        )
-        if is_dist_offload_dp:
-            dp_size = od_config.parallel_config.data_parallel_size
+        # DP multi-concurrency: allow batching dp_size requests so each
+        # worker processes a different request in parallel.  This benefits
+        # all DP strategies (layerwise_dp, dist_offload_dp with or without
+        # AllGather) — without it, requests are processed one at a time
+        # and the second worker stays idle.
+        dp_size = 1
+        if getattr(od_config, "parallel_config", None) is not None:
+            dp_size = getattr(od_config.parallel_config, "data_parallel_size", 1)
+        if dp_size > 1:
             self.scheduler.max_num_running_reqs = dp_size
             self.dp_concurrent = True
             # Ensure batch admission waits for requests to accumulate
             if getattr(od_config, "request_batch_max_wait_ms", 0) == 0:
                 od_config.request_batch_max_wait_ms = 500.0
-            logger.info(f"dist_offload_dp: max_num_running_reqs={dp_size}, batch_wait={od_config.request_batch_max_wait_ms}ms")
+            logger.info(f"dp_concurrent: max_num_running_reqs={dp_size}, batch_wait={od_config.request_batch_max_wait_ms}ms")
         else:
             self.dp_concurrent = False
         self.main_loop: asyncio.AbstractEventLoop | None = None

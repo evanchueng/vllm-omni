@@ -428,7 +428,7 @@ class DiffusionWorker:
         # DP multi-concurrency: pick one request per rank
         is_batch = isinstance(req, list)
         if is_batch:
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            rank = self.rank
             idx = rank % len(req)
             req = req[idx]
 
