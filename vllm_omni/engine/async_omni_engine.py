@@ -1010,6 +1010,10 @@ class AsyncOmniEngine:
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
+            "enable_iterative_attention": kwargs.get("enable_iterative_attention", False),
+            "iterative_attention_group_size": kwargs.get("iterative_attention_group_size", 1),
+            "enable_iterative_mlp": kwargs.get("enable_iterative_mlp", False),
+            "mlp_chunk_size": kwargs.get("mlp_chunk_size", 20480),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"

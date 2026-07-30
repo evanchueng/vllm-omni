@@ -77,20 +77,14 @@ class Attention(nn.Module):
         config = get_current_diffusion_config_or_none()
         attention_config = config.diffusion_attention_config if config is not None else None
 
-        from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
-
-        model_class_name = getattr(config, "model_class_name", None) if config is not None else None
-        allow_trtllm_default = get_diffusion_model_metadata(model_class_name).attention_mask_free
-
         attn_backend_cls, spec = get_attn_backend_for_role(
             role=role,
             head_size=head_size,
             attention_config=attention_config,
             role_category=role_category,
-            allow_trtllm_default=allow_trtllm_default,
         )
         if spec is not None:
-            backend_kwargs = spec.backend_kwargs()
+            backend_kwargs = spec.extra or None
             self.backend_pref = spec.backend
             logger.debug("Attention(role=%s) → backend=%s", role, spec.backend)
         else:
@@ -105,7 +99,6 @@ class Attention(nn.Module):
             causal=causal,
             num_kv_heads=num_kv_heads,
             qkv_layout=qkv_layout,
-            prefix=prefix,
             backend_kwargs=backend_kwargs,
         )
         # Instantiate fallback backend for float32 support
@@ -119,6 +112,9 @@ class Attention(nn.Module):
         )
 
         self.softmax_scale = softmax_scale
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.head_size = head_size
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
         self.use_sync = use_sync
@@ -147,7 +143,6 @@ class Attention(nn.Module):
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
-            causal=causal,
         )
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
@@ -160,6 +155,11 @@ class Attention(nn.Module):
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
         self._init_kv_cache_quantization(config)
+
+        # RFC-3: Iterative (per-head-group) attention processing
+        self._iterative_attention: bool = False
+        self._iterative_group_size: int = 1
+        self._init_iterative_attention(config)
 
     def _get_active_parallel_strategy(self):
         """Get the parallel strategy based on current SP active state.
@@ -216,6 +216,27 @@ class Attention(nn.Module):
             if self.layer_idx is not None and self.layer_idx in skip_layers:
                 return False
         return True
+
+    def _init_iterative_attention(self, config) -> None:
+        """Read iterative attention settings from diffusion config (RFC-3)."""
+        if config is None:
+            return
+        self._iterative_attention = getattr(config, "enable_iterative_attention", False)
+        group_size = getattr(config, "iterative_attention_group_size", 1)
+        if self._iterative_attention:
+            if group_size < 1:
+                group_size = 1
+            # Clamp group_size to num_heads (no point iterating if group >= num_heads)
+            if group_size >= self.num_heads:
+                self._iterative_attention = False
+            else:
+                self._iterative_group_size = group_size
+                logger.debug(
+                    "Iterative attention enabled on %s: group_size=%d, num_heads=%d",
+                    self.role,
+                    group_size,
+                    self.num_heads,
+                )
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         kv_cache_dtype = self._kv_cache_dtype
@@ -290,8 +311,6 @@ class Attention(nn.Module):
         return out
 
     def _run_local_attention(self, query, key, value, attn_metadata):
-        self._assert_piecewise_compatible(attn_metadata)
-
         if query.dtype == torch.float32:
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
@@ -299,31 +318,55 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
+        # RFC-3: Per-head-group iterative attention to reduce activation memory
+        if self._iterative_attention:
+            return self._run_iterative_local_attention(query, key, value, attn_metadata)
+
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
 
-    def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
-        if attn_metadata is None or attn_metadata.full_attn_spans is None:
-            return
-        if attn_metadata.attn_mask is not None and attn_metadata.attn_mask.ndim == 4:
-            return
-        backend_name = self.attn_backend.get_name()
-        if not self.attn_backend.supports_piecewise_spans:
-            raise ValueError(
-                f"Attention backend '{backend_name}' does not support "
-                f"piecewise attention (full_attn_spans without a 4D attn_mask). "
-                f"Use a Flash backend (FLASH_ATTN / FLASH_ATTN_HUB / FLASH_ATTN_3_HUB), "
-                f"or provide a 4D attn_mask that encodes the mixed causal/full pattern."
-            )
+    def _run_iterative_local_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> torch.Tensor:
+        """Iterate through attention heads in groups to reduce peak activation memory.
+
+        Instead of passing all heads to the attention kernel at once, this method
+        loops over groups of heads, computes attention per group, and concatenates
+        the results. Only ``group_size`` heads' intermediates are held at a time.
+
+        Tensors are shaped [B, S, num_heads, head_dim]; head dim is axis 2.
+        For GQA, each query head group shares the corresponding KV head.
+        """
+        num_q_heads = query.shape[2]
+        num_kv_heads = key.shape[2]
+        group_size = self._iterative_group_size
+        # GQA ratio: how many Q heads per KV head
+        q_per_kv = num_q_heads // num_kv_heads
+
+        outputs: list[torch.Tensor] = []
+        for start in range(0, num_q_heads, group_size):
+            end = min(start + group_size, num_q_heads)
+            # Slice Q heads [start:end]
+            q_slice = query[:, :, start:end, :]
+
+            # Map Q head indices to KV head indices (GQA)
+            kv_start = start // q_per_kv
+            kv_end = (end + q_per_kv - 1) // q_per_kv
+            k_slice = key[:, :, kv_start:kv_end, :]
+            v_slice = value[:, :, kv_start:kv_end, :]
+
+            # Run attention kernel for this head group
+            out_slice = self.attention.forward(q_slice, k_slice, v_slice, attn_metadata)
+            outputs.append(out_slice)
+
+        # Concatenate along the head dimension (axis 2)
+        return torch.cat(outputs, dim=2)
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
-        skip = getattr(self.attention, "skip", None)
-        if skip is not None and getattr(skip, "configured", False):
-            raise NotImplementedError(
-                "Skip-Softmax (TRTLLM_ATTN) is not supported with ring sequence parallelism: "
-                "the ring path bypasses the backend, so the skip config would be silently ignored. "
-                "Use Ulysses SP instead, or remove the skip_softmax config."
-            )
         # Delegate to RingParallelAttention strategy if available
         if self.ring_runner is not None:
             return self.ring_runner.run_attention(

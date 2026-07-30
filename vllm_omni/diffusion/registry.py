@@ -397,6 +397,8 @@ def initialize_model(
         # at model loading time, not inside individual model files
         _apply_sequence_parallel_if_enabled(model, od_config)
 
+        _apply_iterative_activation_if_enabled(model, od_config)
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
@@ -684,3 +686,41 @@ def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
         return None  # Return None if no pre-processing function is registered (for backward compatibility)
     func_name = _DIFFUSION_PRE_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
+
+
+def _apply_iterative_activation_if_enabled(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
+    """Apply iterative activation processing hooks if enabled (RFC-3).
+
+    - Per-head iterative attention is handled directly in the ``Attention``
+      layer (reads config at init time), so no hook registration is needed.
+    - Per-chunk iterative MLP is applied by discovering MLP blocks (MoE or
+      dense FFN) and registering ``IterativeMLPHook`` on each.
+
+    Args:
+        model: The pipeline model.
+        od_config: The OmniDiffusion configuration.
+    """
+    from vllm_omni.diffusion.hooks import apply_iterative_mlp_hook
+
+    if getattr(od_config, "enable_iterative_mlp", False):
+        mlp_chunk_size = getattr(od_config, "mlp_chunk_size", 20480)
+        mlp_count = 0
+        for module in model.modules():
+            # MoE: has gate + experts
+            if hasattr(module, "gate") and hasattr(module, "experts"):
+                apply_iterative_mlp_hook(module, chunk_size=mlp_chunk_size)
+                mlp_count += 1
+            # Gated MLP: has gate_proj + down_proj
+            elif hasattr(module, "gate_proj") and hasattr(module, "down_proj"):
+                apply_iterative_mlp_hook(module, chunk_size=mlp_chunk_size)
+                mlp_count += 1
+            # Standard FFN: has linear_fc1 + linear_fc2
+            elif hasattr(module, "linear_fc1") and hasattr(module, "linear_fc2"):
+                apply_iterative_mlp_hook(module, chunk_size=mlp_chunk_size)
+                mlp_count += 1
+            # Standard FFN variant: has fc1 + fc2
+            elif hasattr(module, "fc1") and hasattr(module, "fc2"):
+                apply_iterative_mlp_hook(module, chunk_size=mlp_chunk_size)
+                mlp_count += 1
+        if mlp_count:
+            logger.info("Applied iterative MLP to %d blocks (chunk_size=%d)", mlp_count, mlp_chunk_size)
