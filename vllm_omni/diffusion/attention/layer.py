@@ -220,18 +220,31 @@ class Attention(nn.Module):
     def _init_iterative_attention(self, config) -> None:
         """Read iterative attention settings from diffusion config (RFC-3)."""
         if config is None:
+            logger.warning("Iterative attention: config is None, cannot read settings")
             return
         self._iterative_attention = getattr(config, "enable_iterative_attention", False)
         group_size = getattr(config, "iterative_attention_group_size", 1)
+        logger.info(
+            "Iterative attention config: enable=%s, group_size=%d, num_heads=%d, role=%s",
+            self._iterative_attention,
+            group_size,
+            self.num_heads,
+            self.role,
+        )
         if self._iterative_attention:
             if group_size < 1:
                 group_size = 1
             # Clamp group_size to num_heads (no point iterating if group >= num_heads)
             if group_size >= self.num_heads:
                 self._iterative_attention = False
+                logger.warning(
+                    "Iterative attention disabled: group_size=%d >= num_heads=%d, no benefit",
+                    group_size,
+                    self.num_heads,
+                )
             else:
                 self._iterative_group_size = group_size
-                logger.debug(
+                logger.info(
                     "Iterative attention enabled on %s: group_size=%d, num_heads=%d",
                     self.role,
                     group_size,

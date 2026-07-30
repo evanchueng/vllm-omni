@@ -131,3 +131,50 @@ def remove_iterative_mlp_hook(module: nn.Module) -> None:
     if registry is not None:
         registry.remove_hook(IterativeMLPHook._HOOK_NAME)
         logger.debug("Removed iterative MLP hook from %s", module.__class__.__name__)
+
+
+def apply_vae_temporal_chunking(vae: nn.Module, chunk_size: int = 30) -> None:
+    """Wrap VAE.decode to process frames in temporal chunks.
+
+    The VAE latent has shape [B, C, T, H, W]. Standard decode processes all
+    T frames at once, producing [B, C_out, T*4, H*16, W*16] which can be
+    enormous for long videos (e.g. 720 frames at 4K = 35.8 GB in bf16).
+
+    This wrapper splits T into chunks of ``chunk_size`` frames, decodes each
+    chunk independently, and concatenates the outputs. Peak memory is reduced
+    from T frames to chunk_size frames.
+
+    The VAE's spatial tiling (if enabled) still works within each temporal
+    chunk — the two optimizations are orthogonal.
+
+    Args:
+        vae: The VAE module (must have a ``decode`` method).
+        chunk_size: Number of latent frames per temporal chunk (default: 30).
+    """
+    orig_decode = vae.decode
+
+    def chunked_decode(z, return_dict=True, *args, **kwargs):
+        # z shape: [B, C, T, H, W]
+        num_frames = z.shape[2]
+        if num_frames <= chunk_size:
+            return orig_decode(z, return_dict=return_dict, *args, **kwargs)
+
+        outputs = []
+        for start in range(0, num_frames, chunk_size):
+            end = min(start + chunk_size, num_frames)
+            chunk_z = z[:, :, start:end, :, :]
+            chunk_out = orig_decode(chunk_z, return_dict=return_dict, *args, **kwargs)
+            if isinstance(chunk_out, tuple):
+                outputs.append(chunk_out[0])
+            else:
+                outputs.append(chunk_out.sample if hasattr(chunk_out, "sample") else chunk_out)
+
+        result = torch.cat(outputs, dim=2)
+        if return_dict:
+            from diffusers.models.autoencoders.vae import DecoderOutput
+
+            return (DecoderOutput(sample=result),)
+        return (result,)
+
+    vae.decode = chunked_decode
+    logger.info("VAE temporal chunking enabled: chunk_size=%d frames", chunk_size)
