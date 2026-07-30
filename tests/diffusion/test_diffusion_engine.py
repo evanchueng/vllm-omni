@@ -658,6 +658,7 @@ async def test_async_add_req_and_stream_response():
     engine.supports_request_batch = True
     engine.step_execution = False
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
+    engine.dp_concurrent = False
 
     def _finalize(rid, out, err=None, **kwargs):
         # Stream consumers stop on ``finished``; keep result_data for assertions.
