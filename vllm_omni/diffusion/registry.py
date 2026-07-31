@@ -397,6 +397,15 @@ def initialize_model(
         # at model loading time, not inside individual model files
         _apply_sequence_parallel_if_enabled(model, od_config)
 
+        _apply_iterative_activation_if_enabled(model, od_config)
+
+        # Apply VAE temporal chunking if configured
+        vae_chunk_size = getattr(od_config, "vae_temporal_chunk_size", 30)
+        if vae_chunk_size > 0 and hasattr(model, "vae"):
+            from vllm_omni.diffusion.hooks import apply_vae_temporal_chunking
+
+            apply_vae_temporal_chunking(model.vae, chunk_size=vae_chunk_size)
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
@@ -684,3 +693,99 @@ def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
         return None  # Return None if no pre-processing function is registered (for backward compatibility)
     func_name = _DIFFUSION_PRE_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
+
+
+def _apply_iterative_activation_if_enabled(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
+    """Apply iterative activation processing hooks if enabled (RFC-3).
+
+    - Per-head iterative attention is handled directly in the ``Attention``
+      layer (reads config at init time), so no hook registration is needed.
+    - Per-chunk iterative MLP is applied by discovering MLP blocks (MoE or
+      dense FFN) and registering ``IterativeMLPHook`` on each.
+
+    Iterative attention is only compatible with DP (not SP/TP/CFG):
+    - SP requires ring attention (cross-rank K/V exchange), but iterative
+      attention bypasses it with local per-head-group attention.
+    - TP shards attention heads across ranks, but iterative attention
+      iterates over heads within a single rank.
+    - CFG parallel also shards attention, conflicting with head iteration.
+
+    Iterative MLP is compatible with all parallel strategies: MLP is
+    per-token (no cross-token dependency), so SP/TP/CFG token sharding
+    is orthogonal to MLP chunking.
+
+    Args:
+        model: The pipeline model.
+        od_config: The OmniDiffusion configuration.
+    """
+    from vllm_omni.diffusion.hooks import apply_iterative_mlp_hook
+
+    enable_iterative_attn = getattr(od_config, "enable_iterative_attention", False)
+    enable_iterative_mlp = getattr(od_config, "enable_iterative_mlp", False)
+
+    # Iterative attention requires DP-only (no SP/TP/CFG)
+    if enable_iterative_attn:
+        pc = od_config.parallel_config
+        sp_size = getattr(pc, "sequence_parallel_size", 1)
+        ulysses = getattr(pc, "ulysses_degree", 1)
+        ring = getattr(pc, "ring_degree", 1)
+        tp_size = getattr(pc, "tensor_parallel_size", 1)
+        cfg_size = getattr(pc, "cfg_parallel_size", 1)
+        if sp_size > 1 or ulysses > 1 or ring > 1:
+            raise ValueError(
+                "Iterative attention (RFC-3) is incompatible with Sequence "
+                f"Parallelism (sp_size={sp_size}, ulysses={ulysses}, ring={ring}). "
+                "Iterative attention bypasses ring attention with local "
+                "per-head-group computation. Please use --data-parallel-size."
+            )
+        if tp_size > 1:
+            raise ValueError(
+                "Iterative attention (RFC-3) is incompatible with Tensor "
+                f"Parallelism (tp_size={tp_size}). TP shards attention heads "
+                "across ranks, but iterative attention iterates over heads "
+                "within a single rank."
+            )
+        if cfg_size > 1:
+            raise ValueError(
+                "Iterative attention (RFC-3) is incompatible with CFG "
+                f"Parallelism (cfg_parallel_size={cfg_size}). CFG also shards "
+                "attention, conflicting with per-head-group iteration."
+            )
+
+    # Iterative MLP is compatible with all parallel strategies (per-token, no cross-token dep)
+    if enable_iterative_mlp:
+        from vllm_omni.diffusion.hooks import apply_iterative_layer_hook, apply_iterative_mlp_hook
+
+        mlp_chunk_size = getattr(od_config, "mlp_chunk_size", 20480)
+
+        # Prefer layer-level chunking when the model exposes decoder layers:
+        # this chunks QKV projection + attention + MLP together, so the
+        # full-token-count Q/K/V never materialises on GPU.  Only apply to
+        # non-causal (generation) layers — causal layers cannot be chunked.
+        layer_count = 0
+        for module in model.modules():
+            # Cosmos3GenDecoderLayer: non-causal cross-attention + MLP
+            if hasattr(module, "cross_attention") and hasattr(module, "mlp"):
+                apply_iterative_layer_hook(module, chunk_size=mlp_chunk_size)
+                layer_count += 1
+        if layer_count:
+            logger.info("Applied iterative layer to %d GEN decoder layers (chunk_size=%d)", layer_count, mlp_chunk_size)
+        else:
+            # Fallback: hook individual MLP modules (no QKV reduction, but
+            # still reduces MLP intermediate activation memory)
+            mlp_count = 0
+            for module in model.modules():
+                if hasattr(module, "gate") and hasattr(module, "experts"):
+                    apply_iterative_mlp_hook(module, chunk_size=mlp_chunk_size)
+                    mlp_count += 1
+                elif hasattr(module, "gate_proj") and hasattr(module, "down_proj"):
+                    apply_iterative_mlp_hook(module, chunk_size=mlp_chunk_size)
+                    mlp_count += 1
+                elif hasattr(module, "linear_fc1") and hasattr(module, "linear_fc2"):
+                    apply_iterative_mlp_hook(module, chunk_size=mlp_chunk_size)
+                    mlp_count += 1
+                elif hasattr(module, "fc1") and hasattr(module, "fc2"):
+                    apply_iterative_mlp_hook(module, chunk_size=mlp_chunk_size)
+                    mlp_count += 1
+            if mlp_count:
+                logger.info("Applied iterative MLP to %d blocks (chunk_size=%d)", mlp_count, mlp_chunk_size)

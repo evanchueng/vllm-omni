@@ -476,6 +476,12 @@ class _DiffusionConfigProjection:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+
+    # Iterative activation processing (RFC-3)
+    enable_iterative_attention: bool = False
+    iterative_attention_group_size: int = 1
+    enable_iterative_mlp: bool = False
+    mlp_chunk_size: int = 20480
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)

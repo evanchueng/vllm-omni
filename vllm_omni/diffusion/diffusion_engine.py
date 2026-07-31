@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+_ASYNC_OUTPUT_TIMEOUT = 3600.0
 
 __all__ = [
     "DiffusionEngine",

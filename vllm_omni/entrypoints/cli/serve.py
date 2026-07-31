@@ -665,6 +665,40 @@ class OmniServeCommand(CLISubcommand):
             action="store_false",
             help="Disable AllGather: each rank loads full weights independently.",
         )
+        # Iterative activation processing (RFC-3)
+        omni_config_group.add_argument(
+            "--enable-iterative-attention",
+            action="store_true",
+            help="Enable per-head-group iterative attention to reduce peak activation memory (RFC-3).",
+        )
+        omni_config_group.add_argument(
+            "--iterative-attention-group-size",
+            type=int,
+            default=1,
+            help="Number of attention heads per iteration group (default: 1 = per-head). "
+            "Larger groups improve GEMM utilization but increase memory.",
+        )
+        omni_config_group.add_argument(
+            "--enable-iterative-mlp",
+            action="store_true",
+            help="Enable per-chunk iterative MLP/MoE processing to reduce peak activation memory (RFC-3). "
+            "Auto-detects MoE (gate+experts), gated MLP (gate_proj+down_proj), and standard FFN (fc1+fc2).",
+        )
+        omni_config_group.add_argument(
+            "--mlp-chunk-size",
+            type=int,
+            default=20480,
+            help="Number of tokens per MLP chunk (default: 20480). "
+            "Larger chunks improve GEMM utilization but increase memory.",
+        )
+        omni_config_group.add_argument(
+            "--vae-temporal-chunk-size",
+            type=int,
+            default=30,
+            help="Number of latent frames per VAE temporal chunk (default: 30). "
+            "Reduces VAE decode peak memory for long videos by streaming "
+            "chunk outputs to CPU. Set to 0 to disable.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",
