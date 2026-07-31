@@ -360,7 +360,10 @@ class Attention(nn.Module):
         # GQA ratio: how many Q heads per KV head
         q_per_kv = num_q_heads // num_kv_heads
 
-        outputs: list[torch.Tensor] = []
+        # Pre-allocate output and write in-place to avoid 2x peak memory
+        # from list accumulation + torch.cat.
+        out = torch.empty_like(query)
+
         for start in range(0, num_q_heads, group_size):
             end = min(start + group_size, num_q_heads)
             # Slice Q heads [start:end]
@@ -374,10 +377,10 @@ class Attention(nn.Module):
 
             # Run attention kernel for this head group
             out_slice = self.attention.forward(q_slice, k_slice, v_slice, attn_metadata)
-            outputs.append(out_slice)
+            out[:, :, start:end, :] = out_slice
 
         # Concatenate along the head dimension (axis 2)
-        return torch.cat(outputs, dim=2)
+        return out
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
         # Delegate to RingParallelAttention strategy if available

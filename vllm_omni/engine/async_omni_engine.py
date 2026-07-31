@@ -1014,6 +1014,7 @@ class AsyncOmniEngine:
             "iterative_attention_group_size": kwargs.get("iterative_attention_group_size", 1),
             "enable_iterative_mlp": kwargs.get("enable_iterative_mlp", False),
             "mlp_chunk_size": kwargs.get("mlp_chunk_size", 20480),
+            "vae_temporal_chunk_size": kwargs.get("vae_temporal_chunk_size", 30),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"

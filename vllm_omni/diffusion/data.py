@@ -684,6 +684,7 @@ class OmniDiffusionConfig:
     iterative_attention_group_size: int = 1
     enable_iterative_mlp: bool = False
     mlp_chunk_size: int = 20480
+    vae_temporal_chunk_size: int = 30
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 

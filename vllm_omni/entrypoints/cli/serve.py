@@ -691,6 +691,14 @@ class OmniServeCommand(CLISubcommand):
             help="Number of tokens per MLP chunk (default: 20480). "
             "Larger chunks improve GEMM utilization but increase memory.",
         )
+        omni_config_group.add_argument(
+            "--vae-temporal-chunk-size",
+            type=int,
+            default=30,
+            help="Number of latent frames per VAE temporal chunk (default: 30). "
+            "Reduces VAE decode peak memory for long videos by streaming "
+            "chunk outputs to CPU. Set to 0 to disable.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

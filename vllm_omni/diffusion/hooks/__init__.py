@@ -10,6 +10,7 @@ from vllm_omni.diffusion.hooks.base import (
 from vllm_omni.diffusion.hooks.iterative_activation import (
     IterativeMLPHook,
     apply_iterative_mlp_hook,
+    apply_vae_temporal_chunking,
     remove_iterative_mlp_hook,
 )
 from vllm_omni.diffusion.hooks.sequence_parallel import (
@@ -32,5 +33,6 @@ __all__ = [
     # Iterative activation processing (RFC-3)
     "IterativeMLPHook",
     "apply_iterative_mlp_hook",
+    "apply_vae_temporal_chunking",
     "remove_iterative_mlp_hook",
 ]

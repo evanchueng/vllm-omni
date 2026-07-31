@@ -488,6 +488,7 @@ class OrchestratorArgs:
     iterative_attention_group_size: int = 1
     enable_iterative_mlp: bool = False
     mlp_chunk_size: int = 20480
+    vae_temporal_chunk_size: int = 30
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

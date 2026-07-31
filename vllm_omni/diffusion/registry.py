@@ -399,6 +399,13 @@ def initialize_model(
 
         _apply_iterative_activation_if_enabled(model, od_config)
 
+        # Apply VAE temporal chunking if configured
+        vae_chunk_size = getattr(od_config, "vae_temporal_chunk_size", 30)
+        if vae_chunk_size > 0 and hasattr(model, "vae"):
+            from vllm_omni.diffusion.hooks import apply_vae_temporal_chunking
+
+            apply_vae_temporal_chunking(model.vae, chunk_size=vae_chunk_size)
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")

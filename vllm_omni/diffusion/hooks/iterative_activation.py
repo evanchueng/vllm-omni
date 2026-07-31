@@ -24,6 +24,7 @@ Part 2 — Per-Chunk Iteration for MLP:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -72,14 +73,14 @@ class IterativeMLPHook(ModelHook):
         if num_tokens <= self.chunk_size:
             return self._mlp_forward(module, flat_hidden, *args, **kwargs).view(orig_shape)
 
-        outputs: list[torch.Tensor] = []
+        # Pre-allocate output and write in-place to avoid 2x peak memory
+        # from list accumulation + torch.cat.
+        final_hidden = torch.empty(num_tokens, hidden_dim, device=flat_hidden.device, dtype=flat_hidden.dtype)
         for start in range(0, num_tokens, self.chunk_size):
             end = min(start + self.chunk_size, num_tokens)
-            chunk_hidden = flat_hidden[start:end]
-            chunk_out = self._mlp_forward(module, chunk_hidden, *args, **kwargs)
-            outputs.append(chunk_out)
+            chunk_out = self._mlp_forward(module, flat_hidden[start:end], *args, **kwargs)
+            final_hidden[start:end] = chunk_out
 
-        final_hidden = torch.cat(outputs, dim=0)
         return final_hidden.view(orig_shape)
 
     @staticmethod
@@ -134,47 +135,144 @@ def remove_iterative_mlp_hook(module: nn.Module) -> None:
 
 
 def apply_vae_temporal_chunking(vae: nn.Module, chunk_size: int = 30) -> None:
-    """Wrap VAE.decode to process frames in temporal chunks.
+    """Wrap VAE.decode to process frames in temporal chunks with cache continuity.
 
-    The VAE latent has shape [B, C, T, H, W]. Standard decode processes all
-    T frames at once, producing [B, C_out, T*4, H*16, W*16] which can be
-    enormous for long videos (e.g. 720 frames at 4K = 35.8 GB in bf16).
+    The Wan VAE latent has shape [B, C, T, H, W]. Standard ``_decode`` processes
+    all T frames in a single loop, accumulating the output tensor on GPU — peak
+    memory is O(T * H_out * W_out) which can be enormous for long videos.
 
-    This wrapper splits T into chunks of ``chunk_size`` frames, decodes each
-    chunk independently, and concatenates the outputs. Peak memory is reduced
-    from T frames to chunk_size frames.
+    This wrapper **replicates the ``_decode`` frame loop** (not calling
+    ``_decode`` itself) so that:
 
-    The VAE's spatial tiling (if enabled) still works within each temporal
-    chunk — the two optimizations are orthogonal.
+    - ``feat_cache`` (``_feat_map``) is maintained **across chunk boundaries**,
+      preserving causal temporal continuity.  Calling ``_decode`` per chunk
+      would ``clear_cache()`` between chunks and break the causal chain.
+    - ``first_chunk=True`` is passed **only for the global first frame**
+      (``i == 0``), not for each chunk's first frame.  This preserves the
+      non-uniform temporal upsampling (1 + (T-1)*factor_t output frames).
+    - Completed chunk outputs are moved to CPU immediately, so GPU memory for
+      the output tensor is O(chunk_size) instead of O(T).
+
+    Falls back to the original ``decode`` when spatial tiling or distributed VAE
+    is active (those paths have their own frame loops + ``clear_cache`` that
+    cannot be safely chunked from outside).
 
     Args:
-        vae: The VAE module (must have a ``decode`` method).
+        vae: The VAE module (must have ``post_quant_conv``, ``decoder``,
+            ``_feat_map``, ``_conv_idx``, ``clear_cache`` — i.e. a Wan-style
+            causal VAE).
         chunk_size: Number of latent frames per temporal chunk (default: 30).
     """
+    required = ("post_quant_conv", "decoder", "clear_cache")
+    if not all(hasattr(vae, attr) for attr in required):
+        logger.warning(
+            "VAE temporal chunking: VAE lacks required attributes %s; skipping",
+            [a for a in required if not hasattr(vae, a)],
+        )
+        return
+
     orig_decode = vae.decode
 
+    try:
+        from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify as _unpatchify
+    except ImportError:
+        _unpatchify = None
+    try:
+        from diffusers.models.autoencoders.vae import DecoderOutput
+    except ImportError:
+        DecoderOutput = None
+
+    def _needs_fallback(z: torch.Tensor) -> bool:
+        """True when spatial tiling or distributed VAE would trigger."""
+        if hasattr(vae, "is_distributed_enabled") and vae.is_distributed_enabled():
+            return True
+        if not getattr(vae, "use_tiling", False):
+            return False
+        ratio = max(getattr(vae, "spatial_compression_ratio", 1), 1)
+        tile_min_h = getattr(vae, "tile_sample_min_height", 0) // ratio
+        tile_min_w = getattr(vae, "tile_sample_min_width", 0) // ratio
+        _, _, _, h, w = z.shape
+        return h > tile_min_h or w > tile_min_w
+
+    def _chunked_decode_single(z: torch.Tensor) -> torch.Tensor:
+        """Replicate ``_decode`` frame loop with temporal chunking for one batch element.
+
+        ``feat_cache`` persists across chunks (no ``clear_cache`` between them).
+        Output is streamed to CPU at chunk boundaries.
+        """
+        _, _, num_frame, _, _ = z.shape
+        vae.clear_cache()
+        x = vae.post_quant_conv(z)
+
+        cpu_outputs: list[torch.Tensor] = []
+        out: torch.Tensor | None = None
+
+        for start in range(0, num_frame, chunk_size):
+            end = min(start + chunk_size, num_frame)
+            for j in range(end - start):
+                global_i = start + j
+                vae._conv_idx = [0]
+                frame = x[:, :, global_i : global_i + 1, :, :]
+                if global_i == 0:
+                    out = vae.decoder(
+                        frame,
+                        feat_cache=vae._feat_map,
+                        feat_idx=vae._conv_idx,
+                        first_chunk=True,
+                    )
+                else:
+                    out_ = vae.decoder(
+                        frame,
+                        feat_cache=vae._feat_map,
+                        feat_idx=vae._conv_idx,
+                    )
+                    if out is None:
+                        out = out_
+                    else:
+                        out = torch.cat([out, out_], dim=2)
+
+            cpu_outputs.append(out.cpu())
+            del out
+            out = None
+
+        del x
+        device = z.device
+        result = torch.cat([o.to(device) for o in cpu_outputs], dim=2)
+
+        if getattr(vae.config, "patch_size", None) is not None and _unpatchify is not None:
+            result = _unpatchify(result, patch_size=vae.config.patch_size)
+        result = torch.clamp(result, min=-1.0, max=1.0)
+
+        vae.clear_cache()
+        return result
+
     def chunked_decode(z, return_dict=True, *args, **kwargs):
-        # z shape: [B, C, T, H, W]
-        num_frames = z.shape[2]
+        # Fast path: small frame count or non-5D input
+        num_frames = z.shape[2] if z.ndim == 5 else 0
         if num_frames <= chunk_size:
             return orig_decode(z, return_dict=return_dict, *args, **kwargs)
 
-        outputs = []
-        for start in range(0, num_frames, chunk_size):
-            end = min(start + chunk_size, num_frames)
-            chunk_z = z[:, :, start:end, :, :]
-            chunk_out = orig_decode(chunk_z, return_dict=return_dict, *args, **kwargs)
-            if isinstance(chunk_out, tuple):
-                outputs.append(chunk_out[0])
+        # Fallback for tiled / distributed VAE (their own frame loops + clear_cache)
+        if _needs_fallback(z):
+            logger.debug(
+                "VAE temporal chunking: falling back to full decode "
+                "(tiling or distributed VAE active)"
+            )
+            return orig_decode(z, return_dict=return_dict, *args, **kwargs)
+
+        exec_ctx = getattr(vae, "_execution_context", None)
+        ctx = exec_ctx() if callable(exec_ctx) else nullcontext()
+        with ctx:
+            if getattr(vae, "use_slicing", False) and z.shape[0] > 1:
+                decoded = torch.cat([_chunked_decode_single(s) for s in z.split(1)])
             else:
-                outputs.append(chunk_out.sample if hasattr(chunk_out, "sample") else chunk_out)
+                decoded = _chunked_decode_single(z)
 
-        result = torch.cat(outputs, dim=2)
-        if return_dict:
-            from diffusers.models.autoencoders.vae import DecoderOutput
-
-            return (DecoderOutput(sample=result),)
-        return (result,)
+        if not return_dict:
+            return (decoded,)
+        if DecoderOutput is not None:
+            return DecoderOutput(sample=decoded)
+        return decoded
 
     vae.decode = chunked_decode
     logger.info("VAE temporal chunking enabled: chunk_size=%d frames", chunk_size)
